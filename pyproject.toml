@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "universal-ai-tools"
+dynamic = ["version"]
+description = "Local-first, AI-agnostic developer automation platform exposed over the Model Context Protocol."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.13"
+authors = [{ name = "paramthakkar24-sudo" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+dependencies = [
+    "mcp>=2.3,<3",
+    "pydantic>=2.12,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0,<10",
+    "ruff>=0.17,<0.18",
+    "mypy>=2.4,<3",
+]
+
+[project.scripts]
+universal-ai-tools = "universal_ai_tools.server:main"
+
+[tool.hatch.version]
+path = "src/universal_ai_tools/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/universal_ai_tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "S", "PT"]
+
+[tool.ruff.lint.per-file-ignores]
+# assert is the pytest idiom; subprocess use in tests launches our own server.
+"tests/**" = ["S101", "S603"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]

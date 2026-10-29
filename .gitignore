@@ -1,0 +1,62 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.whl
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.p8
+*.asc
+*.kdbx
+credentials.json
+service-account*.json
+secrets.*
+
+# Local MCP / editor state
+.mcp.json
+.mcp.*.json
+.codex/
+.claude/
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Additional credential files rejected by the workspace tools
+id_rsa*
+id_ed25519*
+.netrc
+.pgpass
+
+# Additional local caches
+.tox/
+.nox/
+.cache/
+coverage.xml
