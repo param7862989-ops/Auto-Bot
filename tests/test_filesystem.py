@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from support import link_directory, link_file, short_name, write
 from universal_ai_tools import workspace as workspace_module
 from universal_ai_tools.config import ENV_WORKSPACE, load_config
 from universal_ai_tools.filesystem import (
@@ -47,35 +48,6 @@ def outside(tmp_path: Path) -> Path:
     path.mkdir()
     (path / "secret.txt").write_text(f"{OUTSIDE_MARKER}\n", encoding="utf-8")
     return path
-
-
-def write(path: Path, content: str | bytes) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(content, bytes):
-        path.write_bytes(content)
-    else:
-        path.write_bytes(content.encode("utf-8"))
-    return path
-
-
-def link_directory(link: Path, target: Path) -> None:
-    """Create a directory symlink, or a junction on Windows without symlink privilege."""
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        if sys.platform == "win32":
-            import _winapi
-
-            _winapi.CreateJunction(str(target), str(link))
-        else:
-            pytest.skip("cannot create symlinks on this system")
-
-
-def link_file(link: Path, target: Path) -> None:
-    try:
-        link.symlink_to(target)
-    except OSError:
-        pytest.skip("cannot create file symlinks here (Windows needs a privilege)")
 
 
 def refusal(excinfo: pytest.ExceptionInfo[WorkspaceError], *, tmp_path: Path) -> str:
@@ -140,11 +112,11 @@ def test_list_recursive_is_depth_first_and_skips_excluded(workspace: Workspace, 
 
 
 def test_list_excluded_directory_explicitly(workspace: Workspace, root: Path) -> None:
-    write(root / ".git" / "HEAD", "ref: refs/heads/main")
+    write(root / ".venv" / "pyvenv.cfg", "home = /usr")
 
-    result = list_files(workspace, ".git")
+    result = list_files(workspace, ".venv")
 
-    assert [e.path for e in result.entries] == [".git/HEAD"]
+    assert [e.path for e in result.entries] == [".venv/pyvenv.cfg"]
 
 
 def test_list_empty_directory(workspace: Workspace, root: Path) -> None:
@@ -238,14 +210,16 @@ def test_list_skips_unreadable_subdirectory(
 ) -> None:
     write(root / "locked" / "hidden.txt", "x")
     write(root / "open" / "visible.txt", "x")
-    real_scandir = os.scandir
+    real_scan = workspace_module._scan_entries
 
-    def scandir(path: Path) -> object:
-        if Path(path).name == "locked":
-            raise PermissionError(13, "Permission denied", str(path))
-        return real_scandir(path)
+    def scan(directory: workspace_module._Directory) -> list[os.DirEntry[str]]:
+        real = directory.real_path()
+        assert real is not None
+        if Path(real).name == "locked":
+            raise PermissionError(13, "Permission denied", real)
+        return real_scan(directory)
 
-    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(workspace_module, "_scan_entries", scan)
 
     result = list_files(workspace, recursive=True)
 
@@ -513,14 +487,14 @@ def test_read_permission_error_is_reported_safely(
     workspace: Workspace, root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     write(root / "locked.txt", "contents")
-    real_open = os.open
+    real_open = workspace_module._open_file
 
-    def deny(path: str | Path, flags: int, *args: int, **kwargs: object) -> int:
-        if Path(path).name == "locked.txt":
-            raise PermissionError(13, "Permission denied", str(path))
-        return real_open(path, flags, *args)
+    def deny(directory: workspace_module._Directory, name: str) -> int:
+        if name == "locked.txt":
+            raise PermissionError(13, "Permission denied", str(root / name))
+        return real_open(directory, name)
 
-    monkeypatch.setattr(os, "open", deny)
+    monkeypatch.setattr(workspace_module, "_open_file", deny)
 
     with pytest.raises(WorkspaceError) as excinfo:
         read_file(workspace, "locked.txt")
@@ -550,16 +524,16 @@ def test_file_swapped_after_check_is_refused(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Simulates a race: the checked path is replaced before it is opened."""
+    """A real race: the checked file is replaced on disk just before it is opened."""
     write(root / "a.txt", "inside")
-    real_open = os.open
+    replacement = write(root / "replacement.txt", f"{OUTSIDE_MARKER}\n")
+    real_open = workspace_module._open_file
 
-    def swap(path: str | Path, flags: int, *args: int, **kwargs: object) -> int:
-        if Path(path).name == "a.txt":
-            return real_open(outside / "secret.txt", flags, *args)
-        return real_open(path, flags, *args)
+    def swap(directory: workspace_module._Directory, name: str) -> int:
+        os.replace(replacement, root / "a.txt")
+        return real_open(directory, name)
 
-    monkeypatch.setattr(os, "open", swap)
+    monkeypatch.setattr(workspace_module, "_open_file", swap)
 
     with pytest.raises(WorkspaceError) as excinfo:
         read_file(workspace, "a.txt")
@@ -579,20 +553,80 @@ def test_opened_file_outside_workspace_is_refused(
 ) -> None:
     """Even if the identity check were fooled, the opened file's real path is verified."""
     write(root / "a.txt", "inside")
-    real_open = os.open
 
-    def swap(path: str | Path, flags: int, *args: int, **kwargs: object) -> int:
-        if Path(path).name == "a.txt":
-            return real_open(outside / "secret.txt", flags, *args)
-        return real_open(path, flags, *args)
+    def escape(directory: workspace_module._Directory, name: str) -> int:
+        return os.open(outside / "secret.txt", os.O_RDONLY | getattr(os, "O_BINARY", 0))
 
-    monkeypatch.setattr(os, "open", swap)
-    monkeypatch.setattr(os.path, "samestat", lambda _a, _b: True)
+    monkeypatch.setattr(workspace_module, "_open_file", escape)
+    monkeypatch.setattr(workspace_module, "_same_file", lambda _a, _b: True)
 
     with pytest.raises(WorkspaceError) as excinfo:
         read_file(workspace, "a.txt")
 
     assert refusal(excinfo, tmp_path=tmp_path) == "path resolves outside the workspace: 'a.txt'"
+
+
+UNVERIFIABLE_LOCATION = (
+    "cannot verify the location of an open file or directory, because its path cannot be "
+    "read from /proc/self/fd; refusing access"
+)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux reads real paths from /proc")
+def test_unreadable_proc_refuses_instead_of_skipping_checks(
+    workspace: Workspace, root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without /proc the real-path checks cannot run, so nothing is served."""
+    write(root / "sub" / "a.txt", "inside")
+    real_readlink = os.readlink
+
+    def no_proc(path: str, *, dir_fd: int | None = None) -> str:
+        if path.startswith("/proc/"):
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+        return real_readlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "readlink", no_proc)
+
+    with pytest.raises(WorkspaceError) as excinfo:
+        read_file(workspace, "sub/a.txt")
+    assert refusal(excinfo, tmp_path=tmp_path) == UNVERIFIABLE_LOCATION
+    with pytest.raises(WorkspaceError) as excinfo:
+        list_files(workspace, "sub")
+    assert refusal(excinfo, tmp_path=tmp_path) == UNVERIFIABLE_LOCATION
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux reads real paths from /proc")
+def test_real_path_too_long_to_report_is_refused(
+    workspace: Workspace, root: Path, tmp_path: Path
+) -> None:
+    """A path the kernel will not report fails closed rather than skipping the checks.
+
+    A process that can rename directories can push any file past this limit, so the limit
+    must never switch the real-path checks off.
+    """
+    file_name = "f" * 200 + ".txt"
+    folder_length = workspace_module.MAX_PATH_CHARS - 1 - len(file_name)
+    parts = ["d" * 200] * ((folder_length + 1) // 201)
+    parts.append("e" * (folder_length - len("/".join(parts)) - 1))
+    folder = "/".join(parts)
+    (root / folder).mkdir(parents=True)
+    directory = os.open(root / folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        # The file's absolute path is too long to pass to open(), so go through its directory.
+        fd = os.open(file_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+        os.write(fd, b"inside")
+        os.close(fd)
+    finally:
+        os.close(directory)
+    relative = f"{folder}/{file_name}"
+    assert len(relative) <= workspace_module.MAX_PATH_CHARS
+    assert len(os.fsencode(root / relative)) >= 4096, "longer than Linux reports from /proc"
+
+    # The directory's own path can still be reported, so only the file is refused.
+    assert [entry.path for entry in list_files(workspace, folder).entries] == [relative]
+    with pytest.raises(WorkspaceError) as excinfo:
+        read_file(workspace, relative)
+    assert refusal(excinfo, tmp_path=tmp_path) == UNVERIFIABLE_LOCATION
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows path rules")
@@ -867,14 +901,14 @@ def test_search_counts_unreadable_files(
 ) -> None:
     write(root / "locked.txt", "needle")
     write(root / "open.txt", "needle")
-    real_open = os.open
+    real_open = workspace_module._open_file
 
-    def deny(path: str | Path, flags: int, *args: int, **kwargs: object) -> int:
-        if Path(path).name == "locked.txt":
-            raise PermissionError(13, "Permission denied", str(path))
-        return real_open(path, flags, *args)
+    def deny(directory: workspace_module._Directory, name: str) -> int:
+        if name == "locked.txt":
+            raise PermissionError(13, "Permission denied", str(root / name))
+        return real_open(directory, name)
 
-    monkeypatch.setattr(os, "open", deny)
+    monkeypatch.setattr(workspace_module, "_open_file", deny)
 
     result = search_files(workspace, "needle")
 
@@ -888,42 +922,21 @@ MIB = 1024 * 1024
 BOM = b"\xef\xbb\xbf"
 
 
-def short_name(path: Path) -> str:
-    """Return the Windows 8.3 short name of an existing path, or skip if there is none."""
-    if sys.platform != "win32":
-        pytest.skip("8.3 short names are a Windows feature")
-    import ctypes
-
-    buffer = ctypes.create_unicode_buffer(1024)
-    if not ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer)):
-        pytest.skip("cannot query 8.3 short names here")
-    name = Path(buffer.value).name
-    if name.casefold() == path.name.casefold():
-        pytest.skip("8.3 short names are disabled on this volume")
-    return name
-
-
 def after_free_check(
     monkeypatch: pytest.MonkeyPatch, name: str, action: Callable[[], None]
 ) -> None:
     """Run ``action`` right after write_file has seen that ``name`` does not exist yet.
 
-    This simulates another process acting between the checks and the creation.
+    This is a real race: another process acting between the checks and the creation.
     """
-    real_lstat = os.lstat
-    pending = True
+    real_create = workspace_module._create_new_file
 
-    def lstat(path: str | Path, *args: object, **kwargs: object) -> os.stat_result:
-        nonlocal pending
-        if pending and Path(path).name == name:
-            pending = False
-            try:
-                return real_lstat(path)
-            finally:
-                action()
-        return real_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+    def create(directory: workspace_module._Directory, created: str) -> object:
+        if created == name:
+            action()
+        return real_create(directory, created)
 
-    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(workspace_module, "_create_new_file", create)
 
 
 def test_write_file_creates_new_file(workspace: Workspace, root: Path) -> None:
@@ -1228,34 +1241,39 @@ def test_write_parent_swapped_for_link_after_checks_is_refused(
     tmp_path: Path,
     swap_to: str,
 ) -> None:
-    """Simulates a race: a checked parent directory is replaced by a link."""
+    """A real race: a checked parent directory is replaced by a link before the create."""
     (root / "sub").mkdir()
     (root / "other").mkdir()
     (root / ".git").mkdir()
     destination = outside if swap_to == "outside" else root / swap_to
+    blocked: list[str] = []
 
     def swap() -> None:
-        (root / "sub").rename(root / "sub-real")
+        try:
+            (root / "sub").rename(root / "sub-real")
+        except PermissionError:
+            blocked.append("sub")
+            return
         link_directory(root / "sub", destination)
 
     after_free_check(monkeypatch, "new.txt", swap)
 
-    with pytest.raises(WorkspaceError) as excinfo:
-        write_file(workspace, "sub/new.txt", "data")
-
-    message = refusal(excinfo, tmp_path=tmp_path)
     if sys.platform == "win32":
-        # Windows creates by path and then verifies, removing the file by handle.
-        reason = {
-            "outside": "path resolves outside the workspace: 'sub/new.txt'",
-            "other": "directory changed while the file was being created: 'sub/new.txt'",
-            ".git": "writing to excluded directories is not allowed: 'sub/new.txt'",
-        }[swap_to]
-        assert message == f"{reason}; the new file was removed"
+        # The parent is held open without delete sharing, so the swap itself cannot happen.
+        write_file(workspace, "sub/new.txt", "data")
+        assert blocked == ["sub"]
+        assert (root / "sub" / "new.txt").read_bytes() == b"data"
     else:
-        # POSIX opens each directory with O_NOFOLLOW, so nothing is created at all.
-        assert message == "directory changed while the file was being created: 'sub'"
-    for directory in (outside, root / "other", root / ".git", root / "sub-real"):
+        with pytest.raises(WorkspaceError) as excinfo:
+            write_file(workspace, "sub/new.txt", "data")
+
+        # POSIX creates through the pinned descriptor, then sees where the file ended up.
+        assert refusal(excinfo, tmp_path=tmp_path) == (
+            "directory changed while the file was being created: 'sub/new.txt'; "
+            "the new file was removed"
+        )
+        assert not (root / "sub-real" / "new.txt").exists()
+    for directory in (outside, root / "other", root / ".git"):
         assert not (directory / "new.txt").exists()
 
 
@@ -1477,9 +1495,6 @@ def test_write_sensitive_directories_are_refused(
 @pytest.mark.parametrize(
     "path",
     [
-        ".git/hooks/pre-commit",
-        ".GIT/config.new",
-        "sub/.git/info/exclude.new",
         ".venv/lib/sitecustomize.py",
         "venv/pyvenv.cfg.new",
         "sub/node_modules/pkg/index.js",
@@ -1487,7 +1502,6 @@ def test_write_sensitive_directories_are_refused(
         "pkg.egg-info/PKG-INFO.new",
         ".pytest_cache/state",
         ".mypy_cache/state",
-        ".hg/hgrc.new",
     ],
 )
 def test_write_inside_excluded_directories_is_refused(
@@ -1504,14 +1518,22 @@ def test_write_inside_excluded_directories_is_refused(
     assert not (root / path).exists()
 
 
-@pytest.mark.parametrize("path", [".git", "sub/.git", "node_modules", ".venv"])
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        (".git", "access to repository metadata is not allowed"),
+        ("sub/.git", "access to repository metadata is not allowed"),
+        ("node_modules", "writing to excluded directories is not allowed"),
+        (".venv", "writing to excluded directories is not allowed"),
+    ],
+)
 def test_write_file_named_like_excluded_directory_is_refused(
-    workspace: Workspace, root: Path, path: str
+    workspace: Workspace, root: Path, path: str, message: str
 ) -> None:
     """A '.git' file can point Git at another repository, so it is refused too."""
     (root / "sub").mkdir()
 
-    with pytest.raises(WorkspaceError, match="writing to excluded directories is not allowed"):
+    with pytest.raises(WorkspaceError, match=message):
         write_file(workspace, path, "gitdir: ../elsewhere\n")
 
     assert not (root / path).exists()
@@ -1520,8 +1542,9 @@ def test_write_file_named_like_excluded_directory_is_refused(
 @pytest.mark.parametrize(
     ("directory", "message"),
     [
-        (".git", "writing to excluded directories is not allowed"),
+        (".git", "access to repository metadata is not allowed"),
         (".ssh", "access to sensitive directories is not allowed"),
+        ("node_modules", "writing to excluded directories is not allowed"),
     ],
 )
 def test_write_through_short_name_alias_is_refused(

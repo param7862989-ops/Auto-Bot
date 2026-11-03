@@ -5,22 +5,32 @@ verified location inside the authorized workspace root, or refuses it with a
 ``WorkspaceError``. Error messages are safe to show to the client: they name only
 the workspace-relative path and never include file contents or absolute paths.
 
-Checks, in order:
+What may be accessed is decided by ``universal_ai_tools.policy``; this module only
+enforces it. Checks, in order:
 
 1. Lexical, before touching the filesystem: the path must be relative and must not
-   contain ``..``, NUL, or a sensitive directory name. On Windows, drive letters,
-   UNC prefixes, alternate data streams, and reserved device names are refused.
-2. Per component, with ``os.lstat``: every component must be a real directory or
-   file, not a symlink, Windows junction, or other name-surrogate reparse point.
-3. After opening a file: the descriptor must refer to a regular file, must be the
-   same file (device and inode) that step 2 inspected, and, where the platform can
-   report it, its real path must lie inside the workspace root.
+   contain ``..`` or NUL, and the policy must allow it. On Windows, drive letters, UNC
+   prefixes, alternate data streams, and reserved device names are refused.
+2. Pinned traversal: from the root, each component is opened without following links
+   and is verified through that open handle. A symlink, Windows junction, or other
+   name-surrogate reparse point is refused. On Linux and macOS the next component is
+   opened relative to the previous descriptor. On Windows every handle stays open
+   without delete sharing, so no component can be renamed until the operation ends.
+3. After opening a file: the descriptor must refer to a regular file, must be the file
+   step 2 inspected, must have one name (a hard link can be any file on the volume),
+   and its real path must lie inside the root and pass the policy again. That catches
+   aliases such as Windows 8.3 short names. On Windows, Linux, and macOS the real path is
+   required: if it cannot be read, the operation is refused. Other platforms cannot
+   report it, and the check is skipped there.
 
-Step 3 means file contents from outside the root are never returned, even if a
-directory is swapped for a link between the check and the open. Directory
-listings rely on steps 1-2 plus a re-check of the directory's real path, which
-narrows but does not close that window. See docs/architecture.md for the
-remaining limitations.
+The link count is read once, after opening. It is NOT a guarantee against a process that
+creates and removes hard links while a file is being read: on Linux such a process can
+make the count read 1 for a file that also has a name outside the workspace. See
+docs/architecture.md.
+
+Steps 2 and 3 run for every operation, and directories get the same real-path check,
+so a listing is as confined as a read. See docs/architecture.md for the remaining
+limitations.
 
 ``create_file`` is the only operation that changes the filesystem. It creates one
 new file with an exclusive create (``O_CREAT | O_EXCL`` or ``CREATE_NEW``), so it
@@ -35,34 +45,19 @@ import errno
 import os
 import stat
 import sys
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-# Directories whose contents no tool may access, at any depth.
-SENSITIVE_DIRECTORY_NAMES = frozenset({".ssh", ".gnupg", ".aws"})
+from universal_ai_tools.policy import Operation, refusal
 
-# Files that read_file refuses and search_files skips. Names are matched
-# case-insensitively. Listing them (names only) is allowed.
-_SENSITIVE_FILE_NAMES = frozenset(
-    {".env", ".netrc", ".pgpass", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
-)
-_SENSITIVE_FILE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
-_ENV_TEMPLATE_NAMES = frozenset({".env.example", ".env.sample", ".env.template"})
+# The longest path accepted, which also bounds what a refusal can quote.
+MAX_PATH_CHARS = 4096
 
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _REPARSE_TAG_NAME_SURROGATE = 0x20000000
-
-_OPEN_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_BINARY", 0)
-    | getattr(os, "O_NOINHERIT", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-    # Never block on a FIFO or claim a terminal, should one slip past the type checks.
-    | getattr(os, "O_NONBLOCK", 0)
-    | getattr(os, "O_NOCTTY", 0)
-)
 
 
 class WorkspaceError(Exception):
@@ -77,15 +72,15 @@ class PathNotFoundError(WorkspaceError):
     """A path, or one of its parent directories, does not exist."""
 
 
-def is_sensitive_file_name(name: str) -> bool:
-    """Return whether ``name`` looks like a credential or secrets file."""
-    folded = name.casefold()
-    if folded in _ENV_TEMPLATE_NAMES:
-        return False
-    return (
-        folded in _SENSITIVE_FILE_NAMES
-        or folded.startswith(".env.")
-        or folded.endswith(_SENSITIVE_FILE_SUFFIXES)
+class HardLinkError(WorkspaceError):
+    """A file has several names, so the name that was checked says nothing about it."""
+
+
+def _is_redirect(attributes: int, reparse_tag: int) -> bool:
+    # Junctions and other name surrogates redirect to another path. Other reparse
+    # points, such as OneDrive cloud files, are ordinary files and are allowed.
+    return bool(
+        attributes & _FILE_ATTRIBUTE_REPARSE_POINT and reparse_tag & _REPARSE_TAG_NAME_SURROGATE
     )
 
 
@@ -94,18 +89,13 @@ def is_link(st: os.stat_result) -> bool:
     if stat.S_ISLNK(st.st_mode):
         return True
     if sys.platform == "win32":
-        # Junctions and other name surrogates redirect to another path. Other reparse
-        # points, such as OneDrive cloud files, are ordinary files and are allowed.
-        return bool(
-            st.st_file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
-            and st.st_reparse_tag & _REPARSE_TAG_NAME_SURROGATE
-        )
+        return _is_redirect(st.st_file_attributes, st.st_reparse_tag)
     return False
 
 
 @dataclass(frozen=True)
 class ResolvedPath:
-    """A location inside the workspace that passed the lexical and ``lstat`` checks."""
+    """A location inside the workspace that passed the lexical and traversal checks."""
 
     parts: tuple[str, ...]
     """Components relative to the workspace root; empty for the root itself."""
@@ -136,6 +126,33 @@ class ResolvedPath:
         return is_link(self.stat)
 
 
+class FileReader:
+    """Reads files one at a time, keeping the current parent directory pinned between them.
+
+    A search reads many files from each directory, and walking down from the root for
+    every one of them is most of its cost. Every read still verifies what it opened.
+    """
+
+    def __init__(self, workspace: Workspace) -> None:
+        self._workspace = workspace
+        self._parts: tuple[str, ...] = ()
+        self._directory: _Directory | None = None
+
+    def read(self, target: ResolvedPath, max_bytes: int) -> bytes:
+        """Read a file as ``Workspace.read_bytes`` does."""
+        parts = target.parts[:-1]
+        if self._directory is None or self._parts != parts:
+            self.close()
+            self._directory = self._workspace._pin(parts, target.relative)
+            self._parts = parts
+        return self._workspace._read_in(self._directory, target, max_bytes)
+
+    def close(self) -> None:
+        if self._directory is not None:
+            self._directory.close()
+            self._directory = None
+
+
 class Workspace:
     """Confines filesystem access to one authorized root directory.
 
@@ -151,35 +168,36 @@ class Workspace:
         """Resolved root directory this workspace is confined to."""
         return self._root
 
-    def resolve(self, raw: str, *, for_reading: bool = False) -> ResolvedPath:
-        """Validate an untrusted relative path and ``lstat`` each of its components.
+    def resolve(self, raw: str, *, operation: Operation = Operation.LIST) -> ResolvedPath:
+        """Validate an untrusted relative path and inspect it without following links.
 
         Args:
             raw: Path relative to the workspace root. ``/`` and ``\\`` are both
                 separators; ``""`` and ``"."`` mean the root.
-            for_reading: Also refuse a sensitive final file name before the
-                filesystem is touched, so refusal does not reveal whether it exists.
+            operation: What the caller will do with the path. The policy refuses it
+                before the filesystem is touched, so a refusal does not reveal whether
+                the path exists.
 
         Raises:
             WorkspaceError: If the path is malformed, escapes the workspace, passes
-                through a link, or does not exist.
+                through a link, is refused by the policy, or does not exist.
         """
         parts = _split_relative(raw)
-        if for_reading and parts and is_sensitive_file_name(parts[-1]):
-            raise WorkspaceError(f"reading sensitive files is not allowed: '{'/'.join(parts)}'")
-
         relative = "/".join(parts) or "."
-        current = self._root
-        st = self._lstat(current, relative)
-        for index, part in enumerate(parts):
-            current = current / part
-            st = self._lstat(current, relative)
-            prefix = "/".join(parts[: index + 1])
-            if is_link(st):
-                raise WorkspaceError(f"refusing to follow symlink or junction: '{prefix}'")
-            if index < len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
-                raise WorkspaceError(f"not a directory: '{prefix}'")
-        return ResolvedPath(tuple(parts), current, st)
+        _enforce(parts, operation, relative)
+        if not parts:
+            try:
+                return ResolvedPath((), self._root, os.lstat(self._root))
+            except OSError as exc:
+                raise _os_error(exc, relative) from None
+        with self._pinned(parts[:-1], relative) as parent:
+            try:
+                st = parent.lstat(parts[-1])
+            except OSError as exc:
+                raise _os_error(exc, relative) from None
+        if is_link(st):
+            raise WorkspaceError(f"refusing to follow symlink or junction: '{relative}'")
+        return ResolvedPath(tuple(parts), self._root.joinpath(*parts), st)
 
     def scan_directory(self, directory: ResolvedPath) -> list[ResolvedPath]:
         """Return the entries of ``directory``, sorted by name, without following links.
@@ -188,23 +206,22 @@ class Workspace:
         """
         if not directory.is_dir:
             raise WorkspaceError(f"not a directory: '{directory.relative}'")
-        try:
-            real = os.path.realpath(directory.absolute, strict=True)
-            self._require_inside(real, directory.relative, is_file=False)
-            with os.scandir(directory.absolute) as iterator:
-                found = sorted(iterator, key=lambda entry: entry.name)
-        except OSError as exc:
-            raise _os_error(exc, directory.relative) from None
-
         children: list[ResolvedPath] = []
-        for entry in found:
+        with self._pinned(directory.parts, directory.relative) as pinned:
             try:
-                st = entry.stat(follow_symlinks=False)
-            except OSError:
-                continue
-            children.append(
-                ResolvedPath((*directory.parts, entry.name), directory.absolute / entry.name, st)
-            )
+                found = sorted(_scan_entries(pinned), key=lambda entry: entry.name)
+            except OSError as exc:
+                raise _os_error(exc, directory.relative) from None
+            for entry in found:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                children.append(
+                    ResolvedPath(
+                        (*directory.parts, entry.name), directory.absolute / entry.name, st
+                    )
+                )
         return children
 
     def read_bytes(self, target: ResolvedPath, max_bytes: int) -> bytes:
@@ -212,32 +229,44 @@ class Workspace:
 
         Raises:
             FileTooLargeError: If the file is larger than ``max_bytes``.
+            HardLinkError: If the file has more than one name.
             WorkspaceError: If the target is not a regular file inside the workspace,
-                changed while being opened, or cannot be read.
+                changed while being opened, is refused by the policy, or cannot be read.
         """
-        relative = target.relative
+        with self._pinned(target.parts[:-1], target.relative) as parent:
+            return self._read_in(parent, target, max_bytes)
+
+    @contextmanager
+    def file_reader(self) -> Iterator[FileReader]:
+        """Return a reader for many files, for operations that walk a directory tree."""
+        reader = FileReader(self)
         try:
-            before = os.lstat(target.absolute)
-        except OSError as exc:
-            raise _os_error(exc, relative) from None
-        if is_link(before):
+            yield reader
+        finally:
+            reader.close()
+
+    def _read_in(self, parent: _Directory, target: ResolvedPath, max_bytes: int) -> bytes:
+        relative = target.relative
+        if target.is_link:
             raise WorkspaceError(f"refusing to follow symlink or junction: '{relative}'")
-        if stat.S_ISDIR(before.st_mode):
+        if target.is_dir:
             raise WorkspaceError(f"is a directory, not a file: '{relative}'")
-        if not stat.S_ISREG(before.st_mode):
+        if not target.is_file:
             raise WorkspaceError(f"not a regular file: '{relative}'")
 
         try:
-            fd = os.open(target.absolute, _OPEN_FLAGS)
+            fd = _open_file(parent, target.name)
         except OSError as exc:
             raise _os_error(exc, relative) from None
         try:
             opened = os.fstat(fd)
-            if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(before, opened):
+            if not stat.S_ISREG(opened.st_mode) or not _same_file(target.stat, opened):
                 raise WorkspaceError(f"file changed while being opened: '{relative}'")
             real = _real_path_of_fd(fd)
             if real is not None:
-                self._require_inside(real, relative, is_file=True)
+                self._require_allowed(real, relative, Operation.READ)
+            if opened.st_nlink > 1:
+                raise HardLinkError(f"refusing to read hard-linked file: '{relative}'")
             if opened.st_size > max_bytes:
                 raise FileTooLargeError(
                     f"file is too large: '{relative}' is {opened.st_size} bytes; "
@@ -254,18 +283,13 @@ class Workspace:
             )
         return data
 
-    def create_file(
-        self, raw: str, data: bytes, *, is_protected_directory: Callable[[str], bool]
-    ) -> str:
+    def create_file(self, raw: str, data: bytes) -> str:
         """Create a new file containing ``data``. Never replaces anything that exists.
 
         Args:
             raw: Untrusted path of the new file, relative to the workspace root. Its
                 parent directory must already exist.
             data: The complete file contents.
-            is_protected_directory: Returns whether a path component names a directory
-                that must not be written into (such as ``.git``). It is applied to the
-                requested path and to the parent directory's real path.
 
         Returns:
             The workspace-relative path of the created file.
@@ -280,42 +304,38 @@ class Workspace:
         if not parts or raw.replace("\\", "/").rsplit("/", 1)[-1] in ("", "."):
             raise WorkspaceError("path must name a file, not a directory")
         relative = "/".join(parts)
-        if is_sensitive_file_name(parts[-1]):
-            raise WorkspaceError(f"writing sensitive files is not allowed: '{relative}'")
-        if any(is_protected_directory(part) for part in parts):
-            raise WorkspaceError(f"writing to excluded directories is not allowed: '{relative}'")
-
-        parent_relative = "/".join(parts[:-1]) or "."
-        try:
-            parent = self.resolve(parent_relative)
-        except PathNotFoundError:
-            raise WorkspaceError(f"parent directory does not exist: '{parent_relative}'") from None
-        if not parent.is_dir:
-            raise WorkspaceError(f"not a directory: '{parent_relative}'")
-        try:
-            real_parent = os.path.realpath(parent.absolute, strict=True)
-        except OSError as exc:
-            raise _os_error(exc, parent_relative) from None
-        # The real path also catches aliases such as the 8.3 short name GIT~1 for .git.
-        inside = self._require_inside(real_parent, relative, is_file=False)
-        if any(is_protected_directory(part) for part in inside):
-            raise WorkspaceError(f"writing to excluded directories is not allowed: '{relative}'")
+        _enforce(parts, Operation.CREATE, relative)
 
         name = parts[-1]
-        target = parent.absolute / name
-        if self._exists(target, relative):
+        parent_relative = "/".join(parts[:-1]) or "."
+        try:
+            with self._pinned(parts[:-1], relative) as parent:
+                self._create_in(parent, name, relative, data)
+        except PathNotFoundError:
+            raise WorkspaceError(f"parent directory does not exist: '{parent_relative}'") from None
+        return relative
+
+    def _create_in(self, parent: _Directory, name: str, relative: str, data: bytes) -> None:
+        try:
+            real_parent = parent.real_path()
+        except OSError as exc:
+            raise _os_error(exc, relative) from None
+        if real_parent is not None:
+            # The real path also catches aliases such as the 8.3 short name GIT~1 for .git.
+            self._require_allowed(os.path.join(real_parent, name), relative, Operation.CREATE)
+        if _exists(parent, name, relative):
             raise WorkspaceError(f"already exists: '{relative}'")
         try:
-            new = _create_new_file(self._root, parent, name)
+            new = _create_new_file(parent, name)
         except OSError as exc:
             # Something appeared since the check. Windows reports an existing directory
             # or junction as access denied rather than as already existing.
-            if isinstance(exc, FileExistsError) or self._exists(target, relative):
+            if isinstance(exc, FileExistsError) or _exists(parent, name, relative):
                 raise WorkspaceError(f"already exists: '{relative}'") from None
             raise _os_error(exc, relative) from None
 
         try:
-            self._verify_created(new.fd, real_parent, name, relative, is_protected_directory)
+            self._verify_created(new.fd, real_parent, name, relative)
             _write_all(new.fd, data)
             os.fsync(new.fd)
             new.close_file()
@@ -334,71 +354,80 @@ class Workspace:
             )
             raise WorkspaceError(f"{reason}; {outcome}") from None
         new.release()
-        return relative
 
-    def _verify_created(
-        self,
-        fd: int,
-        real_parent: str,
-        name: str,
-        relative: str,
-        is_protected_directory: Callable[[str], bool],
-    ) -> None:
+    def _verify_created(self, fd: int, real_parent: str | None, name: str, relative: str) -> None:
         """Check, before writing, that the new file landed where it was meant to."""
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise WorkspaceError(f"file changed while being created: '{relative}'")
         real = _real_path_of_fd(fd)
         if real is None:
-            # Only possible off Windows, where the directory walk in _create_new_file
-            # already pinned the parent directory.
+            # Only possible where the pinned descriptor is the only evidence of location.
             return
-        inside = self._require_inside(real, relative, is_file=False)
-        if any(is_protected_directory(part) for part in inside):
-            raise WorkspaceError(f"writing to excluded directories is not allowed: '{relative}'")
-        # Windows creates by path, so a parent swapped for a junction after the checks
-        # would redirect the file; refuse unless it is exactly where it was checked.
-        if sys.platform == "win32" and Path(real) != Path(real_parent) / name:
+        self._require_allowed(real, relative, Operation.CREATE)
+        # A pinned parent can still be renamed on POSIX. The file would then be somewhere
+        # other than the path that was checked, so it must be exactly where it was meant to be.
+        if real_parent is not None and Path(real) != Path(real_parent) / name:
             raise WorkspaceError(
                 f"directory changed while the file was being created: '{relative}'"
             )
 
-    def _exists(self, path: Path, relative: str) -> bool:
-        """Return whether anything, including a link, exists at ``path``."""
+    @contextmanager
+    def _pinned(self, parts: Sequence[str], relative: str) -> Iterator[_Directory]:
+        """Hold the directory ``parts`` open for the duration of the ``with`` block."""
+        directory = self._pin(parts, relative)
         try:
-            os.lstat(path)
-        except FileNotFoundError:
-            return False
+            yield directory
+        finally:
+            directory.close()
+
+    def _pin(self, parts: Sequence[str], relative: str) -> _Directory:
+        """Open the directory ``parts`` from the root, verifying every step on the way.
+
+        Everything that touches an entry of it goes through this handle or, on Windows,
+        through a path whose every component is held open.
+        """
+        try:
+            directory = _open_root(self._root)
         except OSError as exc:
             raise _os_error(exc, relative) from None
-        return True
-
-    def _lstat(self, path: Path, relative: str) -> os.stat_result:
         try:
-            return os.lstat(path)
+            for index, part in enumerate(parts):
+                directory.descend(part, "/".join(parts[: index + 1]))
+            real = directory.real_path()
+            if real is not None:
+                self._require_allowed(real, relative, Operation.LIST)
         except OSError as exc:
+            directory.close()
             raise _os_error(exc, relative) from None
+        except BaseException:
+            directory.close()
+            raise
+        return directory
 
-    def _require_inside(self, real: str, relative: str, *, is_file: bool) -> tuple[str, ...]:
-        """Refuse a real (fully resolved) path outside the root or in a sensitive location.
+    def _require_allowed(self, real: str, relative: str, operation: Operation) -> None:
+        """Refuse a real (fully resolved) path outside the root or refused by the policy.
 
         Checking the real path also catches aliases that lexical checks cannot,
-        such as Windows 8.3 short names. Returns the real path's components
-        relative to the root.
+        such as Windows 8.3 short names.
         """
         try:
             inside = Path(real).relative_to(self._root).parts
         except ValueError:
             raise WorkspaceError(f"path resolves outside the workspace: '{relative}'") from None
-        if any(part.casefold() in SENSITIVE_DIRECTORY_NAMES for part in inside):
-            raise WorkspaceError(f"access to sensitive directories is not allowed: '{relative}'")
-        if is_file and inside and is_sensitive_file_name(inside[-1]):
-            raise WorkspaceError(f"reading sensitive files is not allowed: '{relative}'")
-        return inside
+        _enforce(inside, operation, relative)
+
+
+def _enforce(parts: Sequence[str], operation: Operation, relative: str) -> None:
+    reason = refusal(parts, operation)
+    if reason is not None:
+        raise WorkspaceError(f"{reason}: '{relative}'")
 
 
 def _split_relative(raw: str) -> list[str]:
     if "\x00" in raw:
         raise WorkspaceError("path must not contain NUL characters")
+    if len(raw) > MAX_PATH_CHARS:
+        raise WorkspaceError(f"path is too long: the limit is {MAX_PATH_CHARS} characters")
     if (
         raw.startswith(("/", "\\"))
         or PurePosixPath(raw).is_absolute()
@@ -408,6 +437,10 @@ def _split_relative(raw: str) -> list[str]:
             "path must be relative to the workspace root; absolute paths, drive letters, "
             "and UNC paths are not allowed"
         )
+    try:
+        os.fsencode(raw)
+    except UnicodeEncodeError:
+        raise WorkspaceError("path is not valid text for this filesystem") from None
     parts = [part for part in raw.replace("\\", "/").split("/") if part not in ("", ".")]
     if ".." in parts:
         raise WorkspaceError("path must not contain '..' components")
@@ -415,8 +448,6 @@ def _split_relative(raw: str) -> list[str]:
         for part in parts:
             if ":" in part or os.path.isreserved(part):
                 raise WorkspaceError(f"path component is not allowed on Windows: '{part}'")
-    if any(part.casefold() in SENSITIVE_DIRECTORY_NAMES for part in parts):
-        raise WorkspaceError(f"access to sensitive directories is not allowed: '{'/'.join(parts)}'")
     return parts
 
 
@@ -424,11 +455,30 @@ def _os_error(exc: OSError, relative: str) -> WorkspaceError:
     # Never include exc.filename or str(exc): both can contain absolute paths.
     if isinstance(exc, FileNotFoundError):
         return PathNotFoundError(f"not found: '{relative}'")
+    if exc.errno == errno.ELOOP:
+        return WorkspaceError(f"refusing to follow symlink or junction: '{relative}'")
     if isinstance(exc, NotADirectoryError):
         return WorkspaceError(f"not a directory: '{relative}'")
     if isinstance(exc, PermissionError):
         return WorkspaceError(f"permission denied: '{relative}'")
     return WorkspaceError(f"cannot access '{relative}'")
+
+
+def _same_file(expected: os.stat_result, opened: os.stat_result) -> bool:
+    # Windows directory scans report no file ID, so a scanned entry has no identity to
+    # compare. Everything else read_bytes checks is checked on the open file itself.
+    return expected.st_ino == 0 or os.path.samestat(expected, opened)
+
+
+def _exists(directory: _Directory, name: str, relative: str) -> bool:
+    """Return whether anything, including a link, exists at ``name``."""
+    try:
+        directory.lstat(name)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise _os_error(exc, relative) from None
+    return True
 
 
 def _read_up_to(fd: int, limit: int) -> bytes:
@@ -467,9 +517,8 @@ if sys.platform == "win32":
     ]
     _get_final_path_name.restype = wintypes.DWORD
 
-    def _real_path_of_fd(fd: int) -> str | None:
-        """Return the real path of an open file, as the OS reports it."""
-        handle = msvcrt.get_osfhandle(fd)
+    def _final_path(handle: int) -> str:
+        """Return the real path of an open handle, as the OS reports it."""
         size = 512
         while True:
             buffer = ctypes.create_unicode_buffer(size)
@@ -484,14 +533,26 @@ if sys.platform == "win32":
             return "\\\\" + path[len("\\\\?\\UNC\\") :]
         return path.removeprefix("\\\\?\\")
 
+    def _real_path_of_fd(fd: int) -> str | None:
+        """Return the real path of an open file, as the OS reports it."""
+        return _final_path(msvcrt.get_osfhandle(fd))
+
 elif sys.platform == "linux":
 
-    def _real_path_of_fd(fd: int) -> str | None:
-        """Return the real path of an open file, or None if /proc is unavailable."""
+    def _real_path_of_fd(fd: int) -> str:
+        """Return the real path of an open file or directory, as /proc reports it.
+
+        This fails closed. Without the real path the checks that depend on it cannot run,
+        so any failure refuses the operation: /proc not mounted, or a path longer than the
+        kernel will report, which a process that can rename files can bring about.
+        """
         try:
             return os.readlink(f"/proc/self/fd/{fd}")
         except OSError:
-            return None
+            raise WorkspaceError(
+                "cannot verify the location of an open file or directory, because its "
+                "path cannot be read from /proc/self/fd; refusing access"
+            ) from None
 
 elif sys.platform == "darwin":
     import fcntl
@@ -508,19 +569,31 @@ else:
         return None
 
 
-# Exclusive creation. _create_new_file returns a _NewFile whose ``fd`` is open for
-# writing. ``discard`` removes the file only if it is still the one this process
-# created; ``release`` closes everything that is still open.
+# Pinned traversal. _open_root returns a _Directory for the root, and ``descend`` moves
+# it one verified component down. _open_file and _create_new_file work on its entries.
+#
+# _create_new_file returns a _NewFile whose ``fd`` is open for writing. ``discard`` removes
+# the file only if it is still the one this process created; ``release`` closes the file.
 
 if sys.platform == "win32":
+    _GENERIC_READ = 0x80000000
     _GENERIC_WRITE = 0x40000000
     _DELETE = 0x00010000
+    _FILE_LIST_DIRECTORY = 0x0001
     _FILE_READ_ATTRIBUTES = 0x0080
+    _SYNCHRONIZE = 0x00100000
+    _FILE_SHARE_READ_WRITE = 0x0003
     _CREATE_NEW = 1
+    _OPEN_EXISTING = 3
     _FILE_ATTRIBUTE_NORMAL = 0x80
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
     _FILE_DISPOSITION_INFO_CLASS = 4
     _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+    class _AttributeTagInfo(ctypes.Structure):
+        _fields_ = (("attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD))
 
     _create_file_w = _kernel32.CreateFileW
     _create_file_w.argtypes = [
@@ -533,6 +606,14 @@ if sys.platform == "win32":
         wintypes.HANDLE,
     ]
     _create_file_w.restype = wintypes.HANDLE
+    _get_file_information = _kernel32.GetFileInformationByHandleEx
+    _get_file_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    _get_file_information.restype = wintypes.BOOL
     _set_file_information = _kernel32.SetFileInformationByHandle
     _set_file_information.argtypes = [
         wintypes.HANDLE,
@@ -544,6 +625,103 @@ if sys.platform == "win32":
     _close_handle = _kernel32.CloseHandle
     _close_handle.argtypes = [wintypes.HANDLE]
     _close_handle.restype = wintypes.BOOL
+
+    def _open_handle(path: str, access: int, share: int, disposition: int, flags: int) -> int:
+        handle: int = _create_file_w(path, access, share, None, disposition, flags, None)
+        if handle == _INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return handle
+
+    def _attributes_of(handle: int) -> _AttributeTagInfo:
+        info = _AttributeTagInfo()
+        if not _get_file_information(
+            handle, _FILE_ATTRIBUTE_TAG_INFO_CLASS, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return info
+
+    def _open_directory_handle(path: str) -> int:
+        """Open a directory without following a link, and without allowing deletion.
+
+        The sharing rule only binds handles with data access, which is why this asks for
+        FILE_LIST_DIRECTORY. While it is open, without FILE_SHARE_DELETE, nothing can
+        rename or delete this directory or any directory above it.
+        """
+        return _open_handle(
+            path,
+            _FILE_LIST_DIRECTORY | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+            _FILE_SHARE_READ_WRITE,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+
+    class _Directory:
+        """Open handles for each directory from the root down to this one.
+
+        Windows has no ``openat`` in its public API. Holding every component open has
+        the same effect: ``path`` cannot come to mean anything else while they are held.
+        """
+
+        def __init__(self, handle: int, path: str) -> None:
+            self.path = path
+            self._handles = [handle]
+
+        def child(self, name: str) -> str:
+            return f"{self.path}\\{name}"
+
+        def lstat(self, name: str) -> os.stat_result:
+            return os.lstat(self.child(name))
+
+        def real_path(self) -> str | None:
+            return _final_path(self._handles[-1])
+
+        def descend(self, name: str, prefix: str) -> None:
+            handle = _open_child(self, name)
+            try:
+                info = _attributes_of(handle)
+                if _is_redirect(info.attributes, info.reparse_tag):
+                    raise WorkspaceError(f"refusing to follow symlink or junction: '{prefix}'")
+                if not info.attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    raise WorkspaceError(f"not a directory: '{prefix}'")
+            except BaseException:
+                _close_handle(handle)
+                raise
+            self._handles.append(handle)
+            self.path = self.child(name)
+
+        def close(self) -> None:
+            while self._handles:
+                _close_handle(self._handles.pop())
+
+    def _open_root(root: Path) -> _Directory:
+        path = str(root)
+        return _Directory(_open_directory_handle(path), path)
+
+    def _open_child(directory: _Directory, name: str) -> int:
+        return _open_directory_handle(directory.child(name))
+
+    def _scan_entries(directory: _Directory) -> list[os.DirEntry[str]]:
+        with os.scandir(directory.path) as iterator:
+            return list(iterator)
+
+    def _open_file(directory: _Directory, name: str) -> int:
+        """Open a file for reading without following a link, and return a descriptor."""
+        handle = _open_handle(
+            directory.child(name),
+            _GENERIC_READ,
+            _FILE_SHARE_READ_WRITE,
+            _OPEN_EXISTING,
+            _FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        try:
+            info = _attributes_of(handle)
+            if _is_redirect(info.attributes, info.reparse_tag):
+                raise OSError(errno.ELOOP, "refusing to follow a link")
+            # Without os.O_TEXT the descriptor is binary: newlines are not translated.
+            return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        except BaseException:
+            _close_handle(handle)
+            raise
 
     def _mark_for_deletion(handle: int) -> bool:
         """Delete the file behind ``handle`` when it is closed, whatever its name is by then."""
@@ -573,23 +751,19 @@ if sys.platform == "win32":
                 with suppress(OSError):
                     os.close(self.fd)
 
-    def _create_new_file(root: Path, parent: ResolvedPath, name: str) -> _NewFile:
-        """Create ``name`` in ``parent`` with CREATE_NEW, which never opens an existing file.
+    def _create_new_file(directory: _Directory, name: str) -> _NewFile:
+        """Create ``name`` with CREATE_NEW, which never opens an existing file.
 
         Share mode 0 keeps other processes from opening, renaming, or deleting the
         file until it is closed. DELETE access lets ``discard`` remove it by handle.
         """
-        handle = _create_file_w(
-            str(parent.absolute / name),
+        handle = _open_handle(
+            directory.child(name),
             _GENERIC_WRITE | _DELETE | _FILE_READ_ATTRIBUTES,
             0,
-            None,
             _CREATE_NEW,
             _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
         )
-        if handle == _INVALID_HANDLE_VALUE:
-            raise ctypes.WinError(ctypes.get_last_error())
         try:
             # Without os.O_TEXT the descriptor is binary: newlines are not translated.
             fd = msvcrt.open_osfhandle(handle, 0)
@@ -601,14 +775,79 @@ if sys.platform == "win32":
 
 else:
     _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    _OPEN_FLAGS = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        # Never block on a FIFO or claim a terminal, should one slip past the type checks.
+        | os.O_NONBLOCK
+        | getattr(os, "O_NOCTTY", 0)
+    )
     _CREATE_FLAGS = (
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_NOCTTY", 0)
     )
 
-    class _NewFile:
-        def __init__(self, fd: int, parent_fd: int, name: str, identity: os.stat_result) -> None:
+    class _Directory:
+        """A descriptor reached from the root by ``openat`` with ``O_NOFOLLOW`` at each step.
+
+        Each component is a single name with no ``/`` or ``..``, so this walk gives what
+        ``openat2(RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH)`` would, on every kernel.
+        """
+
+        def __init__(self, fd: int) -> None:
             self.fd = fd
-            self._parent_fd = parent_fd
+
+        def lstat(self, name: str) -> os.stat_result:
+            return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+
+        def real_path(self) -> str | None:
+            return _real_path_of_fd(self.fd)
+
+        def descend(self, name: str, prefix: str) -> None:
+            st = self.lstat(name)
+            if is_link(st):
+                raise WorkspaceError(f"refusing to follow symlink or junction: '{prefix}'")
+            if not stat.S_ISDIR(st.st_mode):
+                raise WorkspaceError(f"not a directory: '{prefix}'")
+            try:
+                fd = _open_child(self, name)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise WorkspaceError(f"directory changed while in use: '{prefix}'") from None
+                raise
+            try:
+                if not os.path.samestat(os.fstat(fd), st):
+                    raise WorkspaceError(f"directory changed while in use: '{prefix}'")
+            except BaseException:
+                os.close(fd)
+                raise
+            os.close(self.fd)
+            self.fd = fd
+
+        def close(self) -> None:
+            os.close(self.fd)
+
+    def _open_root(root: Path) -> _Directory:
+        if os.open not in os.supports_dir_fd:
+            raise WorkspaceError("this platform cannot confine filesystem access")
+        return _Directory(os.open(root, _DIRECTORY_FLAGS))
+
+    def _open_child(directory: _Directory, name: str) -> int:
+        return os.open(name, _DIRECTORY_FLAGS, dir_fd=directory.fd)
+
+    def _scan_entries(directory: _Directory) -> list[os.DirEntry[str]]:
+        with os.scandir(directory.fd) as iterator:
+            return list(iterator)
+
+    def _open_file(directory: _Directory, name: str) -> int:
+        """Open a file for reading without following a link, and return a descriptor."""
+        return os.open(name, _OPEN_FLAGS, dir_fd=directory.fd)
+
+    class _NewFile:
+        def __init__(
+            self, fd: int, directory: _Directory, name: str, identity: os.stat_result
+        ) -> None:
+            self.fd = fd
+            self._directory = directory
             self._name = name
             self._identity = identity
             self._open = True
@@ -622,10 +861,9 @@ else:
             # refers to our file; a narrow window remains between the stat and the
             # unlink (see docs/architecture.md).
             try:
-                current = os.stat(self._name, dir_fd=self._parent_fd, follow_symlinks=False)
-                if not os.path.samestat(current, self._identity):
+                if not os.path.samestat(self._directory.lstat(self._name), self._identity):
                     return False
-                os.unlink(self._name, dir_fd=self._parent_fd)
+                os.unlink(self._name, dir_fd=self._directory.fd)
             except OSError:
                 return False
             return True
@@ -635,51 +873,16 @@ else:
                 self._open = False
                 with suppress(OSError):
                     os.close(self.fd)
-            with suppress(OSError):
-                os.close(self._parent_fd)
 
-    def _create_new_file(root: Path, parent: ResolvedPath, name: str) -> _NewFile:
-        """Create ``name`` with O_CREAT | O_EXCL relative to a pinned parent directory.
-
-        The parent is reached by opening each component with O_NOFOLLOW relative to
-        the previous one, starting at the root, so a component swapped for a symlink
-        after the ``lstat`` checks is refused instead of followed.
-        """
-        if os.open not in os.supports_dir_fd:
-            raise WorkspaceError("creating files is not supported on this platform")
-        try:
-            dir_fd = os.open(root, _DIRECTORY_FLAGS)
-        except OSError as exc:
-            raise _os_error(exc, ".") from None
-        try:
-            for index, part in enumerate(parent.parts):
-                prefix = "/".join(parent.parts[: index + 1])
-                try:
-                    next_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=dir_fd)
-                except OSError as exc:
-                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                        raise WorkspaceError(
-                            f"directory changed while the file was being created: '{prefix}'"
-                        ) from None
-                    raise _os_error(exc, prefix) from None
-                os.close(dir_fd)
-                dir_fd = next_fd
-            if not os.path.samestat(os.fstat(dir_fd), parent.stat):
-                raise WorkspaceError(
-                    f"directory changed while the file was being created: '{parent.relative}'"
-                )
-            fd = os.open(name, _CREATE_FLAGS, 0o666, dir_fd=dir_fd)
-        except BaseException:
-            os.close(dir_fd)
-            raise
+    def _create_new_file(directory: _Directory, name: str) -> _NewFile:
+        """Create ``name`` with O_CREAT | O_EXCL relative to the pinned directory."""
+        fd = os.open(name, _CREATE_FLAGS, 0o666, dir_fd=directory.fd)
         try:
             identity = os.fstat(fd)
         except OSError:
             # Without the file's identity it cannot be removed safely, so it is left.
             os.close(fd)
-            os.close(dir_fd)
-            relative = "/".join((*parent.parts, name))
             raise WorkspaceError(
-                f"failed to write '{relative}'; the incomplete file could not be removed safely"
+                "failed to write the new file; the incomplete file could not be removed safely"
             ) from None
-        return _NewFile(fd, dir_fd, name, identity)
+        return _NewFile(fd, directory, name, identity)

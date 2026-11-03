@@ -6,11 +6,10 @@ import pytest
 from pydantic import ValidationError
 
 from universal_ai_tools.config import (
-    ENV_COMMAND_ALLOWLIST,
-    ENV_ENABLE_COMMAND_TOOLS,
     ENV_ENABLE_WRITE_TOOLS,
     ENV_LOG_LEVEL,
     ENV_WORKSPACE,
+    REMOVED_SETTINGS,
     AppConfig,
     ConfigError,
     load_config,
@@ -73,13 +72,7 @@ def test_only_allowlisted_variables_are_read(workspace: Path, home: Path) -> Non
 
     config = load_config(environ, home=home)
 
-    assert set(config.model_dump()) == {
-        "workspace_root",
-        "log_level",
-        "enable_write_tools",
-        "enable_command_tools",
-        "command_allowlist",
-    }
+    assert set(config.model_dump()) == {"workspace_root", "log_level", "enable_write_tools"}
     assert sentinel not in repr(config)
 
 
@@ -239,33 +232,86 @@ def test_app_config_accepts_only_booleans_for_write_tools(workspace: Path, value
     assert enabled.enable_write_tools is True
 
 
-def test_command_tools_are_disabled_and_allowlist_empty_by_default(
-    workspace: Path, home: Path
-) -> None:
-    config = load_config({ENV_WORKSPACE: str(workspace)}, home=home)
-    assert config.enable_command_tools is False
-    assert config.command_allowlist == ()
+# Removed command execution settings
 
 
-def test_command_settings_are_parsed(workspace: Path, home: Path) -> None:
-    config = load_config(
-        {
-            ENV_WORKSPACE: str(workspace),
-            ENV_ENABLE_COMMAND_TOOLS: " TRUE ",
-            ENV_COMMAND_ALLOWLIST: "pytest, git-status",
-        },
-        home=home,
+def test_removed_settings_are_the_two_command_variables() -> None:
+    assert REMOVED_SETTINGS == (
+        "UNIVERSAL_AI_TOOLS_ENABLE_COMMAND_TOOLS",
+        "UNIVERSAL_AI_TOOLS_COMMAND_ALLOWLIST",
     )
-    assert config.enable_command_tools is True
-    assert config.command_allowlist == ("pytest", "git-status")
 
 
-@pytest.mark.parametrize("value", ["yes", "1", "enabled", "false;true"])
-def test_invalid_command_enable_flag_is_rejected(workspace: Path, home: Path, value: str) -> None:
-    with pytest.raises(ConfigError, match=ENV_ENABLE_COMMAND_TOOLS):
-        load_config({ENV_WORKSPACE: str(workspace), ENV_ENABLE_COMMAND_TOOLS: value}, home=home)
+@pytest.mark.parametrize("setting", REMOVED_SETTINGS)
+@pytest.mark.parametrize(
+    "value", ["true", "false", "pytest", "git", "mypy", "ruff", "pytest,git", "anything"]
+)
+def test_any_value_of_a_removed_setting_stops_the_server(
+    workspace: Path, home: Path, setting: str, value: str
+) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        load_config({ENV_WORKSPACE: str(workspace), setting: value}, home=home)
+
+    assert str(excinfo.value) == (
+        f"Invalid configuration:\n  {setting}: command execution was removed and cannot "
+        "be enabled; unset this variable"
+    )
 
 
-def test_unknown_command_profile_is_rejected(workspace: Path, home: Path) -> None:
-    with pytest.raises(ConfigError, match=ENV_COMMAND_ALLOWLIST):
-        load_config({ENV_WORKSPACE: str(workspace), ENV_COMMAND_ALLOWLIST: "shell"}, home=home)
+def test_both_removed_settings_are_reported_together(workspace: Path, home: Path) -> None:
+    environ = {ENV_WORKSPACE: str(workspace), **dict.fromkeys(REMOVED_SETTINGS, "true")}
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(environ, home=home)
+
+    for setting in REMOVED_SETTINGS:
+        assert setting in str(excinfo.value)
+
+
+@pytest.mark.parametrize("setting", REMOVED_SETTINGS)
+def test_removed_setting_is_refused_from_os_environ(
+    monkeypatch: pytest.MonkeyPatch, workspace: Path, home: Path, setting: str
+) -> None:
+    monkeypatch.setenv(ENV_WORKSPACE, str(workspace))
+    monkeypatch.setenv(setting, "true")
+
+    with pytest.raises(ConfigError, match="command execution was removed"):
+        load_config(home=home)
+
+
+@pytest.mark.parametrize("setting", REMOVED_SETTINGS)
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_blank_removed_setting_counts_as_unset(
+    workspace: Path, home: Path, setting: str, value: str
+) -> None:
+    config = load_config({ENV_WORKSPACE: str(workspace), setting: value}, home=home)
+
+    assert config.workspace_root == workspace.resolve()
+
+
+@pytest.mark.parametrize("setting", REMOVED_SETTINGS)
+def test_removed_setting_value_is_not_echoed(workspace: Path, home: Path, setting: str) -> None:
+    sentinel = "sk-do-not-echo-0123456789"
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config({ENV_WORKSPACE: str(workspace), setting: sentinel}, home=home)
+
+    assert sentinel not in str(excinfo.value)
+
+
+def test_env_example_mentions_no_command_execution() -> None:
+    example = (Path(__file__).parent.parent / ".env.example").read_text(encoding="utf-8")
+
+    assert "run_command" not in example
+    assert "COMMAND" not in example
+    assert "UNIVERSAL_AI_TOOLS_ENABLE_WRITE_TOOLS=false" in example
+
+
+@pytest.mark.parametrize(
+    "field", [("enable_command_tools", True), ("command_allowlist", ("pytest", "git"))]
+)
+def test_app_config_has_no_command_settings(workspace: Path, field: tuple[str, object]) -> None:
+    name, value = field
+
+    with pytest.raises(ValidationError):
+        AppConfig.model_validate({"workspace_root": str(workspace), name: value})

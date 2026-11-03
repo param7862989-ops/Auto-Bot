@@ -46,3 +46,6 @@ jobs:
 
       - name: Test
         run: python -m pytest
+        env:
+          # A security test that cannot run on the platform it covers fails instead of skipping.
+          UNIVERSAL_AI_TOOLS_STRICT_SECURITY_TESTS: "1"

@@ -13,6 +13,11 @@ validates the path; it does not read anything inside it.
 Tools that change files are off unless ``ENV_ENABLE_WRITE_TOOLS`` is exactly
 ``true`` (case-insensitive). Anything other than ``true`` or ``false`` is an error,
 so a typo can never enable them silently.
+
+Command execution does not exist, so nothing here can enable it. The settings that
+used to control it (``REMOVED_SETTINGS``) are checked only so that a value left in a
+registration stops the server, instead of being ignored by a server that was expected
+to behave differently.
 """
 
 from __future__ import annotations
@@ -35,13 +40,9 @@ ENV_PREFIX = "UNIVERSAL_AI_TOOLS_"
 ENV_WORKSPACE = f"{ENV_PREFIX}WORKSPACE"
 ENV_LOG_LEVEL = f"{ENV_PREFIX}LOG_LEVEL"
 ENV_ENABLE_WRITE_TOOLS = f"{ENV_PREFIX}ENABLE_WRITE_TOOLS"
-ENV_ENABLE_COMMAND_TOOLS = f"{ENV_PREFIX}ENABLE_COMMAND_TOOLS"
-ENV_COMMAND_ALLOWLIST = f"{ENV_PREFIX}COMMAND_ALLOWLIST"
 
-CommandName = Literal["pytest", "ruff-check", "mypy-check", "git-status", "git-diff-check"]
-ALLOWED_COMMAND_NAMES = frozenset(
-    ("pytest", "ruff-check", "mypy-check", "git-status", "git-diff-check")
-)
+# Settings of the removed command tool. Any non-blank value is a configuration error.
+REMOVED_SETTINGS = (f"{ENV_PREFIX}ENABLE_COMMAND_TOOLS", f"{ENV_PREFIX}COMMAND_ALLOWLIST")
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -49,8 +50,6 @@ _FIELD_TO_ENV = {
     "workspace_root": ENV_WORKSPACE,
     "log_level": ENV_LOG_LEVEL,
     "enable_write_tools": ENV_ENABLE_WRITE_TOOLS,
-    "enable_command_tools": ENV_ENABLE_COMMAND_TOOLS,
-    "command_allowlist": ENV_COMMAND_ALLOWLIST,
 }
 
 
@@ -72,12 +71,6 @@ class AppConfig(BaseModel):
     enable_write_tools: StrictBool = False
     """Whether tools that create files (``write_file``) are registered. Off by default."""
 
-    enable_command_tools: StrictBool = False
-    """Whether allowlisted command profiles can be executed. Off by default."""
-
-    command_allowlist: tuple[CommandName, ...] = ()
-    """Fixed command profile names permitted by the operator."""
-
     @field_validator("log_level", mode="before")
     @classmethod
     def _normalize_log_level(cls, value: object) -> object:
@@ -93,29 +86,6 @@ class AppConfig(BaseModel):
             if folded not in ("true", "false"):
                 raise ValueError("must be 'true' or 'false' (case-insensitive)")
             return folded == "true"
-        return value
-
-    @field_validator("enable_command_tools", mode="before")
-    @classmethod
-    def _parse_enable_command_tools(cls, value: object) -> object:
-        if isinstance(value, str):
-            folded = value.strip().casefold()
-            if folded not in ("true", "false"):
-                raise ValueError("must be 'true' or 'false' (case-insensitive)")
-            return folded == "true"
-        return value
-
-    @field_validator("command_allowlist", mode="before")
-    @classmethod
-    def _parse_command_allowlist(cls, value: object) -> object:
-        if isinstance(value, str):
-            names = tuple(item.strip().casefold() for item in value.split(",") if item.strip())
-            unknown = sorted(set(names) - ALLOWED_COMMAND_NAMES)
-            if unknown:
-                raise ValueError("contains an unknown command profile")
-            if len(set(names)) != len(names):
-                raise ValueError("must not contain duplicate command profiles")
-            return names
         return value
 
     @field_validator("workspace_root", mode="after")
@@ -153,17 +123,28 @@ def load_config(
 
     Args:
         environ: Mapping to read from. Defaults to ``os.environ``. Only
-            ``ENV_WORKSPACE``, ``ENV_LOG_LEVEL``, ``ENV_ENABLE_WRITE_TOOLS``,
-            ``ENV_ENABLE_COMMAND_TOOLS``, and ``ENV_COMMAND_ALLOWLIST``
-            are read. Optional settings that are empty or whitespace-only are
-            treated as unset.
+            ``ENV_WORKSPACE``, ``ENV_LOG_LEVEL``, ``ENV_ENABLE_WRITE_TOOLS``, and
+            the ``REMOVED_SETTINGS`` are read. Optional settings that are empty or
+            whitespace-only are treated as unset.
         home: Home directory used for the "too broad" check. Defaults to
             ``Path.home()``; overridable for tests.
 
     Raises:
-        ConfigError: If a required setting is missing or any setting is invalid.
+        ConfigError: If a required setting is missing, any setting is invalid, or a
+            removed setting has a value. The value is not echoed.
     """
     source = os.environ if environ is None else environ
+
+    removed = [name for name in REMOVED_SETTINGS if source.get(name, "").strip()]
+    if removed:
+        raise ConfigError(
+            "Invalid configuration:\n"
+            + "\n".join(
+                f"  {name}: command execution was removed and cannot be enabled; "
+                "unset this variable"
+                for name in removed
+            )
+        )
 
     workspace = source.get(ENV_WORKSPACE, "").strip()
     if not workspace:
@@ -179,12 +160,6 @@ def load_config(
     enable_write_tools = source.get(ENV_ENABLE_WRITE_TOOLS, "").strip()
     if enable_write_tools:
         data["enable_write_tools"] = enable_write_tools
-    enable_command_tools = source.get(ENV_ENABLE_COMMAND_TOOLS, "").strip()
-    if enable_command_tools:
-        data["enable_command_tools"] = enable_command_tools
-    command_allowlist = source.get(ENV_COMMAND_ALLOWLIST, "").strip()
-    if command_allowlist:
-        data["command_allowlist"] = command_allowlist
 
     try:
         return AppConfig.model_validate(data, context={"home": home})
