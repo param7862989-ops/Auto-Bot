@@ -353,6 +353,65 @@ def test_concurrent_parent_replacement_never_escapes(
         assert report["first_step_blocked"] > 0
 
 
+LISTING_SECONDS = 2.0
+LISTING_ROUNDS = 4
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows handles pin the path")
+def test_concurrent_parent_replacement_is_blocked_by_the_listing_alone(
+    workspace: Workspace, root: Path, outside: Path
+) -> None:
+    """Only listings run, so only directory handles are open: no file handle, no control.
+
+    In the test above, the files that reads and writes hold open inside ``sub`` also stop
+    the attacker's renames, so it passes even when the directory handles do not pin
+    anything. Here nothing but the pinned directory chain can refuse them.
+    """
+    write(root / "sub" / "a.txt", INSIDE)
+    write(outside / OUTSIDE_ONLY_NAME, OUTSIDE)
+    counts: Counter[str] = Counter()
+    blocked = cycles = 0
+
+    # A few short rounds, stopping at the first that shows a refused rename, so a busy
+    # machine gets more chances. Directory handles that do not pin show none in any round.
+    for _ in range(LISTING_ROUNDS):
+        (root.parent / "stop").unlink(missing_ok=True)
+        with attacker("parent", root, outside, "junction") as report:
+            started = time.monotonic()
+            while time.monotonic() - started < LISTING_SECONDS:
+                listing = attempt(counts, "list", lambda: list_files(workspace, "sub"))
+                assert listing is None or OUTSIDE_ONLY_NAME not in listing.model_dump_json()
+        blocked += report["first_step_blocked"]
+        cycles += report["cycles"]
+        _restore_sub(root)
+        if blocked:
+            break
+
+    print(f"RACE listing: {dict(counts)} cycles={cycles} first_step_blocked={blocked}")
+    assert cycles > 0
+    assert counts["list returned"] > 0
+    # Renames refused by the kernel while a listing held the chain of directory handles.
+    assert blocked > 0
+    assert sorted(os.listdir(outside)) == sorted(["a.txt", OUTSIDE_ONLY_NAME])
+
+
+def _restore_sub(root: Path) -> None:
+    """Put ``sub`` back where the attacker may have left it between its steps."""
+    sub, moved, decoy = root / "sub", root / "sub-real", root / "decoy"
+
+    def present(path: Path) -> bool:
+        return os.path.lexists(path)
+
+    if present(sub) and is_link(os.lstat(sub)):
+        sub.rename(decoy)  # the link stood in for sub; move it aside
+    if not present(sub) and present(moved):
+        moved.rename(sub)
+    if present(decoy):
+        # A junction (or symlink) to the outside: rmdir removes the link, never the target,
+        # and would fail on a real, non-empty directory.
+        os.rmdir(decoy)
+
+
 @pytest.mark.parametrize("kind", FILE_LINK_KINDS)
 def test_concurrent_file_symlink_substitution_never_escapes(
     workspace: Workspace, root: Path, outside: Path, tmp_path: Path, kind: str

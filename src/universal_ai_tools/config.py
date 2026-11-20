@@ -42,7 +42,32 @@ ENV_LOG_LEVEL = f"{ENV_PREFIX}LOG_LEVEL"
 ENV_ENABLE_WRITE_TOOLS = f"{ENV_PREFIX}ENABLE_WRITE_TOOLS"
 
 # Settings of the removed command tool. Any non-blank value is a configuration error.
+# (The terminal capability that exists now is configured only in the config file, under
+# different names; see universal_ai_tools.settings.)
 REMOVED_SETTINGS = (f"{ENV_PREFIX}ENABLE_COMMAND_TOOLS", f"{ENV_PREFIX}COMMAND_ALLOWLIST")
+
+# Settings of the removed API-key agent (archived in legacy/api-agent). Claude, in Claude
+# Desktop or Claude Code, is the orchestrator; this package never calls a model API and never
+# reads an API key. Any non-blank value is a configuration error, so a stale registration
+# fails visibly and a key left in a client configuration is noticed.
+REMOVED_AGENT_SETTINGS = (
+    f"{ENV_PREFIX}ENABLE_AGENT_TOOLS",
+    f"{ENV_PREFIX}AGENT_PROVIDER",
+    f"{ENV_PREFIX}AGENT_MODEL",
+    f"{ENV_PREFIX}ANTHROPIC_API_KEY",
+    f"{ENV_PREFIX}OPENAI_API_KEY",
+    f"{ENV_PREFIX}AGENT_REQUEST_TIMEOUT_SECONDS",
+    f"{ENV_PREFIX}AGENT_MAX_RETRIES",
+    f"{ENV_PREFIX}AGENT_MAX_TASK_SECONDS",
+    f"{ENV_PREFIX}AGENT_MAX_STEPS",
+    f"{ENV_PREFIX}AGENT_MAX_TOOL_CALLS",
+    f"{ENV_PREFIX}AGENT_MAX_INPUT_TOKENS",
+    f"{ENV_PREFIX}AGENT_MAX_OUTPUT_TOKENS",
+    f"{ENV_PREFIX}AGENT_MAX_TOOL_RESULT_CHARS",
+    f"{ENV_PREFIX}AGENT_MAX_CONTEXT_CHARS",
+    f"{ENV_PREFIX}AGENT_MAX_REPEATED_CALLS",
+    f"{ENV_PREFIX}AGENT_APPROVAL_TIMEOUT_SECONDS",
+)
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -123,9 +148,9 @@ def load_config(
 
     Args:
         environ: Mapping to read from. Defaults to ``os.environ``. Only
-            ``ENV_WORKSPACE``, ``ENV_LOG_LEVEL``, ``ENV_ENABLE_WRITE_TOOLS``, and
-            the ``REMOVED_SETTINGS`` are read. Optional settings that are empty or
-            whitespace-only are treated as unset.
+            ``ENV_WORKSPACE``, ``ENV_LOG_LEVEL``, ``ENV_ENABLE_WRITE_TOOLS``, the
+            ``REMOVED_SETTINGS``, and the ``REMOVED_AGENT_SETTINGS`` are read. Optional
+            settings that are empty or whitespace-only are treated as unset.
         home: Home directory used for the "too broad" check. Defaults to
             ``Path.home()``; overridable for tests.
 
@@ -134,17 +159,7 @@ def load_config(
             removed setting has a value. The value is not echoed.
     """
     source = os.environ if environ is None else environ
-
-    removed = [name for name in REMOVED_SETTINGS if source.get(name, "").strip()]
-    if removed:
-        raise ConfigError(
-            "Invalid configuration:\n"
-            + "\n".join(
-                f"  {name}: command execution was removed and cannot be enabled; "
-                "unset this variable"
-                for name in removed
-            )
-        )
+    check_removed_settings(source)
 
     workspace = source.get(ENV_WORKSPACE, "").strip()
     if not workspace:
@@ -165,6 +180,27 @@ def load_config(
         return AppConfig.model_validate(data, context={"home": home})
     except ValidationError as exc:
         raise ConfigError(_format_validation_error(exc)) from None
+
+
+def check_removed_settings(source: Mapping[str, str]) -> None:
+    """Refuse a value in any setting of a removed feature. Values are never echoed.
+
+    Raises:
+        ConfigError: If any of ``REMOVED_SETTINGS`` or ``REMOVED_AGENT_SETTINGS`` is set.
+    """
+    problems = [
+        f"  {name}: command execution was removed and cannot be enabled; unset this variable"
+        for name in REMOVED_SETTINGS
+        if source.get(name, "").strip()
+    ]
+    problems += [
+        f"  {name}: the built-in API agent was removed; Claude Desktop or Claude Code is the "
+        "orchestrator and no API key is used; unset this variable"
+        for name in REMOVED_AGENT_SETTINGS
+        if source.get(name, "").strip()
+    ]
+    if problems:
+        raise ConfigError("Invalid configuration:\n" + "\n".join(problems))
 
 
 def _format_validation_error(exc: ValidationError) -> str:

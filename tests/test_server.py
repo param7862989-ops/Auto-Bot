@@ -581,7 +581,9 @@ async def test_unknown_tool_is_reported_as_error(client: Client) -> None:
 async def test_stdio_server_end_to_end(workspace: Path) -> None:
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "universal_ai_tools.server"],
+        # -P keeps the current directory off sys.path, as -I does, but honours PYTHONPATH,
+        # which the mutation check uses to load its copy of the code.
+        args=["-P", "-m", "universal_ai_tools.server"],
         env={ENV_WORKSPACE: str(workspace)},
     )
 
@@ -612,33 +614,53 @@ async def test_stdio_server_end_to_end(workspace: Path) -> None:
     assert refused.is_error is True
 
 
-@pytest.mark.anyio
-async def test_stdio_server_with_write_tools_enabled(workspace: Path) -> None:
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "universal_ai_tools.server"],
-        env={ENV_WORKSPACE: str(workspace), ENV_ENABLE_WRITE_TOOLS: "TRUE"},
+def test_a_real_process_refuses_environment_mode_writes(workspace: Path) -> None:
+    """Environment mode has no approval and no audit log, so it cannot change files.
+
+    Writes over real stdio, with approval, are covered in file mode by
+    ``test_file_mode_server.test_stdio_task_with_approval``.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("UNIVERSAL_AI_TOOLS_")}
+    completed = subprocess.run(
+        [sys.executable, "-P", "-m", "universal_ai_tools.server"],
+        env={**env, ENV_WORKSPACE: str(workspace), ENV_ENABLE_WRITE_TOOLS: "TRUE"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
 
-    async with Client(params, read_timeout_seconds=30) as client:
-        tools = await client.list_tools()
-        instructions = client.instructions
-        created = await client.call_tool(
-            "write_file", {"path": "docs/created.txt", "content": "made over stdio\r\n"}
-        )
-        overwrite = await client.call_tool(
-            "write_file", {"path": "docs/created.txt", "content": "replaced"}
-        )
-        read = await client.call_tool("read_file", {"path": "docs/created.txt"})
+    assert completed.returncode == 2
+    assert "environment mode has no approval and no audit log" in completed.stderr
+    assert not (workspace / "docs" / "created.txt").exists()
 
-    assert [tool.name for tool in tools.tools] == WRITE_ENABLED_TOOLS
-    assert instructions == WRITE_ENABLED_INSTRUCTIONS
-    assert created.structured_content == {"path": "docs/created.txt", "bytes_written": 17}
-    assert overwrite.is_error is True
-    assert "already exists" in text_of(overwrite)
-    assert (workspace / "docs" / "created.txt").read_bytes() == b"made over stdio\r\n"
-    assert read.structured_content is not None
-    assert read.structured_content["content"] == "made over stdio\r\n"
+
+@pytest.mark.parametrize("isolation", [[], ["-c"]], ids=["-m", "-c"])
+def test_a_real_process_started_without_isolation_refuses_to_run(
+    workspace: Path, tmp_path: Path, isolation: list[str]
+) -> None:
+    """Started in a directory it would import from, the server stops before serving."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("UNIVERSAL_AI_TOOLS_")}
+    command = (
+        [sys.executable, "-c", "from universal_ai_tools.server import main; main()"]
+        if isolation
+        else [sys.executable, "-m", "universal_ai_tools.server"]
+    )
+    completed = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env={**env, ENV_WORKSPACE: str(workspace)},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "Refusing to start" in completed.stderr
+    assert "python -I" in completed.stderr
 
 
 @pytest.mark.parametrize("setting", REMOVED_SETTINGS)

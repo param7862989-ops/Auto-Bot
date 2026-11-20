@@ -34,7 +34,10 @@ class Operation(Enum):
     """Return file content: ``read_file``, ``search_files``, any future exporter."""
 
     CREATE = "create"
-    """Create a new file: ``write_file``."""
+    """Create a new file or directory: ``write_file``, ``create_directory``, a move's target."""
+
+    MODIFY = "modify"
+    """Change or move an existing file or directory: ``edit_file``, a move's source."""
 
 
 # Directories no operation may enter, at any depth. A file with one of these names is
@@ -123,7 +126,9 @@ _SENSITIVE_FILE_SUFFIXES = (
 _SENSITIVE_FILE_REFUSALS = {
     Operation.READ: "reading sensitive files is not allowed",
     Operation.CREATE: "writing sensitive files is not allowed",
+    Operation.MODIFY: "modifying sensitive files is not allowed",
 }
+_CHANGING = frozenset({Operation.CREATE, Operation.MODIFY})
 
 # Characters that can change what a reader sees or a terminal does, and that no text
 # needs to carry literally: C0 and C1 controls except tab and line endings, DEL, line and
@@ -185,7 +190,7 @@ def refusal(parts: Sequence[str], operation: Operation) -> str | None:
         return None
     if is_sensitive_file_name(parts[-1]):
         return _SENSITIVE_FILE_REFUSALS[operation]
-    if operation is Operation.CREATE and any(is_excluded_directory_name(part) for part in parts):
+    if operation in _CHANGING and any(is_excluded_directory_name(part) for part in parts):
         return "writing to excluded directories is not allowed"
     return None
 

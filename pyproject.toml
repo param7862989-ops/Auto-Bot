@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "universal-ai-tools"
 dynamic = ["version"]
-description = "Local-first, AI-agnostic developer automation platform exposed over the Model Context Protocol."
+description = "Local execution service that gives Claude Desktop and Claude Code secure, approved access to your PC over the Model Context Protocol."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -22,9 +22,14 @@ classifiers = [
 dependencies = [
     "mcp>=2.3,<3",
     "pydantic>=2.12,<3",
+    # Windows UI Automation (desktop/uia.py): COM wrappers generated from Windows' own type
+    # library. Pure Python; used only when the screen tools are enabled.
+    "comtypes>=1.4,<2; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
+# No model provider SDKs and no API keys: Claude (Desktop or Code) is the orchestrator and
+# reaches this package only through MCP. The former API agent is archived in legacy/api-agent.
 dev = [
     "pytest>=9.0,<10",
     "ruff>=0.17,<0.18",
@@ -32,7 +37,8 @@ dev = [
 ]
 
 [project.scripts]
-universal-ai-tools = "universal_ai_tools.server:main"
+# With no arguments it serves MCP over stdio, as before; `setup`, `doctor`, `config` manage it.
+universal-ai-tools = "universal_ai_tools.cli:main"
 
 [tool.hatch.version]
 path = "src/universal_ai_tools/__init__.py"
@@ -50,6 +56,8 @@ filterwarnings = ["error"]
 line-length = 100
 target-version = "py313"
 src = ["src", "tests"]
+# Archived code that is no longer part of the package; see legacy/api-agent/README.md.
+extend-exclude = ["legacy"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "S", "PT"]
@@ -57,9 +65,17 @@ select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "S", "PT"]
 [tool.ruff.lint.per-file-ignores]
 # assert is the pytest idiom; subprocess use in tests launches our own server.
 "tests/**" = ["S101", "S603"]
+# Each mutant's text must match the source exactly, so it cannot be wrapped.
+"tests/mutation_check.py" = ["S101", "S603", "E501"]
 
 [tool.mypy]
 python_version = "3.13"
 strict = true
 files = ["src", "tests"]
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# comtypes has no type information; desktop/uia.py treats its objects as Any.
+module = ["comtypes", "comtypes.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

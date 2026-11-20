@@ -32,28 +32,39 @@ Steps 2 and 3 run for every operation, and directories get the same real-path ch
 so a listing is as confined as a read. See docs/architecture.md for the remaining
 limitations.
 
-``create_file`` is the only operation that changes the filesystem. It creates one
-new file with an exclusive create (``O_CREAT | O_EXCL`` or ``CREATE_NEW``), so it
-never replaces anything, and it removes only a file it created itself, identified
-by its open handle or inode. Nothing here renames, overwrites, or deletes
-existing files.
+Operations that change the filesystem:
+
+* ``create_file`` creates one new file with an exclusive create (``O_CREAT | O_EXCL`` or
+  ``CREATE_NEW``), so it never replaces anything, and it removes only a file it created
+  itself, identified by its open handle or inode.
+* ``make_directory`` creates one new directory; it fails if anything exists there.
+* ``replace_file`` writes new content to a temporary file created like ``create_file`` and
+  renames it over an existing regular file, so the change is all or nothing.
+* ``move`` renames a file or directory to a path where nothing exists; it never replaces.
+
+Nothing here deletes an existing file or directory. The only entries ever removed are the
+temporary and new files this module created itself.
 """
 
 from __future__ import annotations
 
 import errno
 import os
+import secrets
 import stat
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from universal_ai_tools.policy import Operation, refusal
+from universal_ai_tools.trusted import TrustedPaths
 
 # The longest path accepted, which also bounds what a refusal can quote.
 MAX_PATH_CHARS = 4096
+
+_CHANGING = frozenset({Operation.CREATE, Operation.MODIFY})
 
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -74,6 +85,29 @@ class PathNotFoundError(WorkspaceError):
 
 class HardLinkError(WorkspaceError):
     """A file has several names, so the name that was checked says nothing about it."""
+
+
+class InvalidPathError(WorkspaceError):
+    """The path is not a valid workspace-relative path: absolute, '..', NUL, too long."""
+
+
+class LinkRefusedError(WorkspaceError):
+    """The path names, or passes through, a symlink, junction, or other redirect."""
+
+
+class PolicyRefusedError(WorkspaceError):
+    """The filesystem policy does not allow this operation on this path."""
+
+
+class OutsideWorkspaceError(WorkspaceError):
+    """The path, once resolved, is outside the workspace."""
+
+
+class ProtectedPathError(WorkspaceError):
+    """The path is part of the server's own code, Python environment, or configuration.
+
+    See ``universal_ai_tools.trusted``. Nothing there is ever created, changed, or moved.
+    """
 
 
 def _is_redirect(attributes: int, reparse_tag: int) -> bool:
@@ -158,10 +192,20 @@ class Workspace:
 
     The root must already be absolute and fully resolved, as ``AppConfig``
     guarantees. It is never widened.
+
+    ``trusted`` are the locations nothing may create, change, or move (see
+    ``universal_ai_tools.trusted``). Without it, the code and Python environment of the
+    running process are protected.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, trusted: TrustedPaths | None = None) -> None:
         self._root = root
+        self._trusted = trusted if trusted is not None else runtime_trusted_paths()
+
+    @property
+    def trusted(self) -> TrustedPaths:
+        """The protected locations this workspace never changes."""
+        return self._trusted
 
     @property
     def root(self) -> Path:
@@ -196,7 +240,7 @@ class Workspace:
             except OSError as exc:
                 raise _os_error(exc, relative) from None
         if is_link(st):
-            raise WorkspaceError(f"refusing to follow symlink or junction: '{relative}'")
+            raise LinkRefusedError(f"refusing to follow symlink or junction: '{relative}'")
         return ResolvedPath(tuple(parts), self._root.joinpath(*parts), st)
 
     def scan_directory(self, directory: ResolvedPath) -> list[ResolvedPath]:
@@ -245,10 +289,16 @@ class Workspace:
         finally:
             reader.close()
 
-    def _read_in(self, parent: _Directory, target: ResolvedPath, max_bytes: int) -> bytes:
+    def _read_in(
+        self,
+        parent: _Directory,
+        target: ResolvedPath,
+        max_bytes: int,
+        operation: Operation = Operation.READ,
+    ) -> bytes:
         relative = target.relative
         if target.is_link:
-            raise WorkspaceError(f"refusing to follow symlink or junction: '{relative}'")
+            raise LinkRefusedError(f"refusing to follow symlink or junction: '{relative}'")
         if target.is_dir:
             raise WorkspaceError(f"is a directory, not a file: '{relative}'")
         if not target.is_file:
@@ -264,7 +314,7 @@ class Workspace:
                 raise WorkspaceError(f"file changed while being opened: '{relative}'")
             real = _real_path_of_fd(fd)
             if real is not None:
-                self._require_allowed(real, relative, Operation.READ)
+                self._require_allowed(real, relative, operation)
             if opened.st_nlink > 1:
                 raise HardLinkError(f"refusing to read hard-linked file: '{relative}'")
             if opened.st_size > max_bytes:
@@ -305,6 +355,7 @@ class Workspace:
             raise WorkspaceError("path must name a file, not a directory")
         relative = "/".join(parts)
         _enforce(parts, Operation.CREATE, relative)
+        self._require_unprotected(self._lexical(parts), relative)
 
         name = parts[-1]
         parent_relative = "/".join(parts[:-1]) or "."
@@ -372,6 +423,220 @@ class Workspace:
             )
 
     @contextmanager
+    def pinned_directory(self, raw: str) -> Iterator[tuple[str, str]]:
+        """Hold a workspace directory pinned and yield ``(relative, absolute path)``.
+
+        For starting a process in it: on Windows the whole chain of directories stays open
+        without delete sharing while the ``with`` block runs, so the path cannot be redirected
+        by renaming a component or swapping in a junction. On POSIX the path yielded is the
+        real path of the pinned descriptor; a rename between that and the process changing
+        into it is not prevented.
+
+        Raises:
+            WorkspaceError: If the path is refused, is not a directory, or passes a link.
+        """
+        target = self.resolve(raw, operation=Operation.LIST)
+        if not target.is_dir:
+            raise WorkspaceError(f"not a directory: '{target.relative}'")
+        with self._pinned(target.parts, target.relative) as directory:
+            real = directory.real_path()
+            yield target.relative, real if real is not None else str(target.absolute)
+
+    def replace_file(
+        self, raw: str, transform: Callable[[bytes], bytes], *, max_read_bytes: int
+    ) -> tuple[bytes, bytes]:
+        """Replace an existing file's content with ``transform(old content)``, atomically.
+
+        The file is read with every check ``read_bytes`` makes, under ``Operation.MODIFY``.
+        The new content goes to a new temporary file in the same directory, created as
+        ``create_file`` creates files, flushed to disk, and then renamed over the original.
+        Until that rename the original is untouched; if anything fails the temporary file
+        is removed. The rename replaces the directory entry, so even a link put in the
+        file's place meanwhile is replaced rather than written through. If the file changed
+        between being read and being replaced, nothing is replaced.
+
+        Returns:
+            The old and the new content.
+
+        Raises:
+            WorkspaceError: If the path is refused, the file cannot be read or replaced, or
+                ``transform`` refuses the content.
+        """
+        parts = _split_relative(raw)
+        if not parts:
+            raise WorkspaceError("path must name a file, not the workspace root")
+        relative = "/".join(parts)
+        _enforce(parts, Operation.MODIFY, relative)
+        self._require_unprotected(self._lexical(parts), relative)
+        name = parts[-1]
+        with self._pinned(parts[:-1], relative) as parent:
+            try:
+                st = parent.lstat(name)
+            except OSError as exc:
+                raise _os_error(exc, relative) from None
+            target = ResolvedPath(tuple(parts), self._root.joinpath(*parts), st)
+            old = self._read_in(parent, target, max_read_bytes, Operation.MODIFY)
+            new = transform(old)
+            # Not derived from the file's name: ".env.py.uat-....tmp" (for env.py) would be
+            # a sensitive name, and the policy would refuse to create it.
+            temporary = f".uat-edit-{secrets.token_hex(8)}.tmp"
+            self._create_in(parent, temporary, relative, new)
+            try:
+                # The edited file keeps its permissions (a script stays executable, a private
+                # file stays private).
+                _copy_mode(parent, temporary, stat.S_IMODE(st.st_mode))
+                current = parent.lstat(name)
+                changed = (
+                    (st.st_ino != 0 and not os.path.samestat(current, st))
+                    or current.st_size != st.st_size
+                    or current.st_mtime_ns != st.st_mtime_ns
+                )
+                if changed:
+                    raise WorkspaceError(f"file changed while being edited: '{relative}'")
+                _rename_entry(parent, temporary, parent, name, replace=True)
+            except BaseException as exc:
+                with suppress(OSError):
+                    _unlink_entry(parent, temporary)
+                if isinstance(exc, OSError):
+                    raise _os_error(exc, relative) from None
+                raise
+        return old, new
+
+    def make_directory(self, raw: str) -> str:
+        """Create one new directory. Its parent must exist; nothing that exists is touched.
+
+        Raises:
+            WorkspaceError: If the path is refused, the parent is missing, or anything
+                already exists at the path.
+        """
+        parts = _split_relative(raw)
+        if not parts:
+            raise WorkspaceError("path must name a new directory, not the workspace root")
+        relative = "/".join(parts)
+        _enforce(parts, Operation.CREATE, relative)
+        self._require_unprotected(self._lexical(parts), relative)
+        parent_relative = "/".join(parts[:-1]) or "."
+        name = parts[-1]
+        try:
+            with self._pinned(parts[:-1], relative) as parent:
+                self._require_new(parent, name, relative)
+                try:
+                    _make_directory(parent, name)
+                except OSError as exc:
+                    if isinstance(exc, FileExistsError) or _exists(parent, name, relative):
+                        raise WorkspaceError(f"already exists: '{relative}'") from None
+                    raise _os_error(exc, relative) from None
+                created = parent.lstat(name)
+                if is_link(created) or not stat.S_ISDIR(created.st_mode):
+                    raise WorkspaceError(f"directory changed while being created: '{relative}'")
+        except PathNotFoundError:
+            raise WorkspaceError(f"parent directory does not exist: '{parent_relative}'") from None
+        return relative
+
+    def move(self, raw_source: str, raw_destination: str) -> tuple[str, str, bool]:
+        """Rename a file or directory to a new path in the workspace. Never replaces anything.
+
+        The source is checked under ``Operation.MODIFY`` and the destination under
+        ``Operation.CREATE``, both lexically and by their real parent directories. Links are
+        refused, and so is a destination inside the source.
+
+        Returns:
+            The source and destination as workspace-relative paths, and whether it was a
+            directory.
+
+        Raises:
+            WorkspaceError: If either path is refused, the source does not exist, or anything
+                exists at the destination.
+        """
+        source_parts = _split_relative(raw_source)
+        destination_parts = _split_relative(raw_destination)
+        if not source_parts or not destination_parts:
+            raise WorkspaceError("the workspace root cannot be moved or replaced")
+        source = "/".join(source_parts)
+        destination = "/".join(destination_parts)
+        _enforce(source_parts, Operation.MODIFY, source)
+        _enforce(destination_parts, Operation.CREATE, destination)
+        self._require_unprotected(self._lexical(source_parts), source, moving=True)
+        self._require_unprotected(self._lexical(destination_parts), destination)
+        if _inside(destination_parts, source_parts):
+            raise WorkspaceError(f"cannot move '{source}' into itself")
+        with self._pinned(source_parts[:-1], source) as source_parent:
+            try:
+                st = source_parent.lstat(source_parts[-1])
+            except OSError as exc:
+                raise _os_error(exc, source) from None
+            if is_link(st):
+                raise LinkRefusedError(f"refusing to move a symlink or junction: '{source}'")
+            is_directory = stat.S_ISDIR(st.st_mode)
+            if not is_directory and not stat.S_ISREG(st.st_mode):
+                raise WorkspaceError(f"not a regular file or directory: '{source}'")
+            real = source_parent.real_path()
+            if real is not None:
+                real_source = os.path.join(real, source_parts[-1])
+                self._require_allowed(real_source, source, Operation.MODIFY)
+                # Moving a directory moves everything in it, protected or not.
+                self._require_unprotected(real_source, source, moving=True)
+                if is_directory:
+                    _refuse_contents(real_source, source_parts, source)
+            destination_parent_relative = "/".join(destination_parts[:-1]) or "."
+            try:
+                with self._pinned(destination_parts[:-1], destination) as destination_parent:
+                    self._require_new(
+                        destination_parent,
+                        destination_parts[-1],
+                        destination,
+                        same_as=st if _case_only(source_parts, destination_parts) else None,
+                    )
+                    try:
+                        _rename_entry(
+                            source_parent,
+                            source_parts[-1],
+                            destination_parent,
+                            destination_parts[-1],
+                            replace=False,
+                        )
+                    except OSError as exc:
+                        if isinstance(exc, FileExistsError) or _exists(
+                            destination_parent, destination_parts[-1], destination
+                        ):
+                            raise WorkspaceError(f"already exists: '{destination}'") from None
+                        raise _os_error(exc, source) from None
+            except PathNotFoundError:
+                raise WorkspaceError(
+                    f"destination directory does not exist: '{destination_parent_relative}'"
+                ) from None
+        # The rename has happened. It is reported as done: a check after it could only
+        # report a completed change as a failure (on FAT32 and exFAT the file id changes
+        # with the move).
+        return source, destination, is_directory
+
+    def _require_new(
+        self,
+        parent: _Directory,
+        name: str,
+        relative: str,
+        *,
+        same_as: os.stat_result | None = None,
+    ) -> None:
+        """Refuse a new entry whose real location is refused, or that already exists.
+
+        ``same_as``: for a rename that only changes case, where the name "exists" because it
+        is the source itself; that entry, and only that one, does not count.
+        """
+        try:
+            real_parent = parent.real_path()
+        except OSError as exc:
+            raise _os_error(exc, relative) from None
+        if real_parent is not None:
+            self._require_allowed(os.path.join(real_parent, name), relative, Operation.CREATE)
+        if _exists(parent, name, relative):
+            if same_as is not None:
+                with suppress(OSError):
+                    if os.path.samestat(parent.lstat(name), same_as):
+                        return
+            raise WorkspaceError(f"already exists: '{relative}'")
+
+    @contextmanager
     def _pinned(self, parts: Sequence[str], relative: str) -> Iterator[_Directory]:
         """Hold the directory ``parts`` open for the duration of the ``with`` block."""
         directory = self._pin(parts, relative)
@@ -413,41 +678,144 @@ class Workspace:
         try:
             inside = Path(real).relative_to(self._root).parts
         except ValueError:
-            raise WorkspaceError(f"path resolves outside the workspace: '{relative}'") from None
+            raise OutsideWorkspaceError(
+                f"path resolves outside the workspace: '{relative}'"
+            ) from None
         _enforce(inside, operation, relative)
+        if operation in _CHANGING:
+            self._require_unprotected(real, relative)
+
+    def _lexical(self, parts: Sequence[str]) -> str:
+        """The path ``parts`` name, before anything is opened.
+
+        Windows ignores trailing dots and spaces in a name, so they are dropped here too.
+        Aliases such as 8.3 short names are caught later, on the real path.
+        """
+        if sys.platform == "win32":
+            parts = [part.rstrip(". ") or part for part in parts]
+        return os.path.join(self._root, *parts)
+
+    def _require_unprotected(self, path: str, relative: str, *, moving: bool = False) -> None:
+        """Refuse to create or change ``path`` if it is a protected location or inside one.
+
+        With ``moving``, also refuse if a protected location is inside it: moving a
+        directory moves what it contains.
+        """
+        entry = self._trusted.protecting(path, str(self._root))
+        if entry is None and moving:
+            entry = self._trusted.contained_in(path)
+        if entry is not None:
+            raise ProtectedPathError(
+                f"refusing to change {entry.reason}, which this server never modifies: '{relative}'"
+            )
+
+
+_runtime_trusted: TrustedPaths | None = None
+
+
+def runtime_trusted_paths() -> TrustedPaths:
+    """The code and Python environment of this process, found once and then kept."""
+    global _runtime_trusted
+    if _runtime_trusted is None:
+        _runtime_trusted = TrustedPaths.for_runtime()
+    return _runtime_trusted
 
 
 def _enforce(parts: Sequence[str], operation: Operation, relative: str) -> None:
     reason = refusal(parts, operation)
     if reason is not None:
-        raise WorkspaceError(f"{reason}: '{relative}'")
+        raise PolicyRefusedError(f"{reason}: '{relative}'")
+
+
+MAX_MOVE_CHECKED_ENTRIES = 20_000
+
+
+def _refuse_contents(real_source: str, source_parts: Sequence[str], source: str) -> None:
+    """Refuse moving a directory that holds anything moving it alone would be refused for:
+    credential files, repository metadata, credential or generated directories.
+
+    Links inside are not followed (they move as links). A directory too large to check is
+    refused rather than moved unchecked.
+
+    Raises:
+        PolicyRefusedError: If an entry would be refused, or there are too many to check.
+    """
+    checked = 0
+    stack: list[tuple[str, list[str]]] = [(real_source, list(source_parts))]
+    while stack:
+        directory, parts = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                found = list(entries)
+        except OSError as exc:
+            raise PolicyRefusedError(
+                f"cannot check what '{source}' contains ({type(exc).__name__}); not moved"
+            ) from None
+        for entry in found:
+            checked += 1
+            if checked > MAX_MOVE_CHECKED_ENTRIES:
+                raise PolicyRefusedError(
+                    f"'{source}' holds more than {MAX_MOVE_CHECKED_ENTRIES} entries, too many to "
+                    "check; move smaller parts of it"
+                )
+            entry_parts = [*parts, entry.name]
+            reason = refusal(entry_parts, Operation.MODIFY)
+            if reason is not None:
+                inner = "/".join(entry_parts[len(source_parts) :])
+                raise PolicyRefusedError(
+                    f"cannot move '{source}': it contains '{inner}', and {reason}"
+                )
+            with suppress(OSError):
+                if entry.is_dir(follow_symlinks=False) and not entry.is_junction():
+                    stack.append((entry.path, entry_parts))
+
+
+def _case_only(source: Sequence[str], destination: Sequence[str]) -> bool:
+    """A rename that changes only the case of names, on a case-insensitive file system."""
+    if sys.platform not in ("win32", "darwin") or list(source) == list(destination):
+        return False
+    return [p.casefold() for p in source] == [p.casefold() for p in destination]
+
+
+def _inside(candidate: Sequence[str], container: Sequence[str]) -> bool:
+    """Whether path ``candidate`` is strictly inside ``container`` (component lists).
+
+    Compared case-insensitively where the file system ignores case (Windows, macOS), so a
+    rename that only changes case is not "inside itself".
+    """
+    if len(candidate) <= len(container):
+        return False
+    if sys.platform in ("win32", "darwin"):
+        candidate = [part.casefold() for part in candidate]
+        container = [part.casefold() for part in container]
+    return list(candidate[: len(container)]) == list(container)
 
 
 def _split_relative(raw: str) -> list[str]:
     if "\x00" in raw:
-        raise WorkspaceError("path must not contain NUL characters")
+        raise InvalidPathError("path must not contain NUL characters")
     if len(raw) > MAX_PATH_CHARS:
-        raise WorkspaceError(f"path is too long: the limit is {MAX_PATH_CHARS} characters")
+        raise InvalidPathError(f"path is too long: the limit is {MAX_PATH_CHARS} characters")
     if (
         raw.startswith(("/", "\\"))
         or PurePosixPath(raw).is_absolute()
         or PureWindowsPath(raw).drive
     ):
-        raise WorkspaceError(
+        raise InvalidPathError(
             "path must be relative to the workspace root; absolute paths, drive letters, "
             "and UNC paths are not allowed"
         )
     try:
         os.fsencode(raw)
     except UnicodeEncodeError:
-        raise WorkspaceError("path is not valid text for this filesystem") from None
+        raise InvalidPathError("path is not valid text for this filesystem") from None
     parts = [part for part in raw.replace("\\", "/").split("/") if part not in ("", ".")]
     if ".." in parts:
-        raise WorkspaceError("path must not contain '..' components")
+        raise InvalidPathError("path must not contain '..' components")
     if sys.platform == "win32":
         for part in parts:
             if ":" in part or os.path.isreserved(part):
-                raise WorkspaceError(f"path component is not allowed on Windows: '{part}'")
+                raise InvalidPathError(f"path component is not allowed on Windows: '{part}'")
     return parts
 
 
@@ -456,7 +824,7 @@ def _os_error(exc: OSError, relative: str) -> WorkspaceError:
     if isinstance(exc, FileNotFoundError):
         return PathNotFoundError(f"not found: '{relative}'")
     if exc.errno == errno.ELOOP:
-        return WorkspaceError(f"refusing to follow symlink or junction: '{relative}'")
+        return LinkRefusedError(f"refusing to follow symlink or junction: '{relative}'")
     if isinstance(exc, NotADirectoryError):
         return WorkspaceError(f"not a directory: '{relative}'")
     if isinstance(exc, PermissionError):
@@ -680,7 +1048,7 @@ if sys.platform == "win32":
             try:
                 info = _attributes_of(handle)
                 if _is_redirect(info.attributes, info.reparse_tag):
-                    raise WorkspaceError(f"refusing to follow symlink or junction: '{prefix}'")
+                    raise LinkRefusedError(f"refusing to follow symlink or junction: '{prefix}'")
                 if not info.attributes & _FILE_ATTRIBUTE_DIRECTORY:
                     raise WorkspaceError(f"not a directory: '{prefix}'")
             except BaseException:
@@ -773,6 +1141,28 @@ if sys.platform == "win32":
             raise
         return _NewFile(fd)
 
+    def _rename_entry(
+        source: _Directory, source_name: str, target: _Directory, target_name: str, *, replace: bool
+    ) -> None:
+        """Rename one entry. Both directories are pinned, so both paths mean what was checked.
+
+        MoveFileExW renames the entry itself and never follows a link at either name. Without
+        ``replace`` it fails if anything exists at the target.
+        """
+        if replace:
+            os.replace(source.child(source_name), target.child(target_name))
+        else:
+            os.rename(source.child(source_name), target.child(target_name))
+
+    def _unlink_entry(directory: _Directory, name: str) -> None:
+        os.unlink(directory.child(name))
+
+    def _copy_mode(directory: _Directory, name: str, mode: int) -> None:
+        """Windows: permission bits do not apply; the read-only attribute is not copied."""
+
+    def _make_directory(directory: _Directory, name: str) -> None:
+        os.mkdir(directory.child(name))
+
 else:
     _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     _OPEN_FLAGS = (
@@ -805,7 +1195,7 @@ else:
         def descend(self, name: str, prefix: str) -> None:
             st = self.lstat(name)
             if is_link(st):
-                raise WorkspaceError(f"refusing to follow symlink or junction: '{prefix}'")
+                raise LinkRefusedError(f"refusing to follow symlink or junction: '{prefix}'")
             if not stat.S_ISDIR(st.st_mode):
                 raise WorkspaceError(f"not a directory: '{prefix}'")
             try:
@@ -886,3 +1276,66 @@ else:
                 "failed to write the new file; the incomplete file could not be removed safely"
             ) from None
         return _NewFile(fd, directory, name, identity)
+
+    def _rename_entry(
+        source: _Directory, source_name: str, target: _Directory, target_name: str, *, replace: bool
+    ) -> None:
+        """Rename one entry relative to two pinned descriptors.
+
+        Without ``replace``, Linux uses ``renameat2(RENAME_NOREPLACE)``, which fails if
+        anything exists at the target. Elsewhere the target is checked first, which leaves a
+        narrow window in which a file created at the target would be replaced.
+        """
+        if replace:
+            os.replace(source_name, target_name, src_dir_fd=source.fd, dst_dir_fd=target.fd)
+            return
+        if _renameat2 is not None:
+            result = _renameat2(
+                source.fd, os.fsencode(source_name), target.fd, os.fsencode(target_name), 1
+            )
+            if result == 0:
+                return
+            code = ctypes.get_errno()
+            if code not in (errno.ENOSYS, errno.EINVAL):
+                raise OSError(code, os.strerror(code))
+        try:
+            os.stat(target_name, dir_fd=target.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.rename(source_name, target_name, src_dir_fd=source.fd, dst_dir_fd=target.fd)
+            return
+        raise FileExistsError(errno.EEXIST, "target exists")
+
+    def _unlink_entry(directory: _Directory, name: str) -> None:
+        os.unlink(name, dir_fd=directory.fd)
+
+    def _copy_mode(directory: _Directory, name: str, mode: int) -> None:
+        os.chmod(name, mode, dir_fd=directory.fd)
+
+    def _make_directory(directory: _Directory, name: str) -> None:
+        os.mkdir(name, 0o777, dir_fd=directory.fd)
+
+    import ctypes
+
+    def _load_renameat2() -> Callable[..., int] | None:
+        if sys.platform != "linux":
+            return None
+        try:
+            # Not ctypes.util.find_library: on Linux it starts ldconfig (and gcc or ld),
+            # and this module must start no process.
+            function = ctypes.CDLL(None, use_errno=True).renameat2
+        except (OSError, AttributeError):
+            try:
+                function = ctypes.CDLL("libc.so.6", use_errno=True).renameat2
+            except (OSError, AttributeError):
+                return None
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        return function
+
+    _renameat2 = _load_renameat2()
